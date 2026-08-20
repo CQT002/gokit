@@ -1071,15 +1071,15 @@ Chốt trong lúc làm:
 > `git remote set-url origin https://github.com/cqt002/gokit.git` cho khớp module path.
 > (Guard `check-module-path` quét cả `*.md`, nên đừng viết dạng viết hoa vào file này.)
 
-### Phase 1 — `core` `⬜`
+### Phase 1 — `core` `🔄`
 
 Thứ tự bắt buộc (do phụ thuộc):
 
-- [ ] `idx`
-- [ ] `secret`
-- [ ] `tracectx` (phụ thuộc `idx`)
-- [ ] `ctxmeta`
-- [ ] `errs`
+- [x] `idx`
+- [x] `secret`
+- [x] `tracectx` (phụ thuộc `idx`)
+- [x] `ctxmeta`
+- [x] `errs`
 - [ ] `log` — handler chain + **masking lớp 1** (elide theo kích thước)
 - [ ] `log` — **masking lớp 2** (`Safe` đọc tag `log:`, cache theo `reflect.Type`)
 - [ ] `log` — **masking lớp 3** (`SafeMap` theo tên field) + trần `MaxLineBytes`
@@ -1090,6 +1090,30 @@ Thứ tự bắt buộc (do phụ thuộc):
 - [ ] `timex`
 
 **Định nghĩa "xong":** coverage ≥ 80%, không cần Docker, godoc đầy đủ cho mọi symbol export.
+
+Đã thêm ngoài đặc tả ở mục 4 (đều là bổ sung, không phá vỡ API đã chốt) — cần soi
+lại khi đóng băng API cuối Phase 1:
+
+| Package | Thêm | Lý do |
+|---|---|---|
+| `secret` | `MarshalYAML`, `IsZero`, `Equal` | Dump config ra YAML là đường lộ ngang hàng với JSON. `Equal` dùng `subtle.ConstantTimeCompare` — `httpx/auth` so khớp API key cần đúng thứ này, để mỗi service tự viết `==` là hở kênh phụ |
+| `tracectx` | `Valid`, `String`, `TraceIDFrom`, `HeaderTraceparent`, `ErrInvalidTraceparent` | `Valid` là điều kiện dùng chung của `Traceparent`/`NewChild`; `HeaderTraceparent` để `httpx` và `kafka` không tự viết lại tên header |
+| `errs` | `HTTPStatus(err)`, `WithCause`, `opts` cho `Wrap` | `httpx.Fail` cần lấy status từ error bất kỳ, kể cả error thường (→ 500) |
+
+Quyết định đáng ghi lại:
+
+- `SpanContext.NewChild()` trên giá trị không hợp lệ trả về **trace gốc mới**, không
+  nhân bản trace ID rỗng — nếu không, mọi request thiếu header sẽ dồn vào chung một
+  "trace" vô nghĩa.
+- `ParseTraceparent` **từ chối hex viết hoa** theo đúng đặc tả W3C. Chỗ gọi coi lỗi
+  parse là "không có trace thượng nguồn" và tạo trace gốc mới, chứ không phải lỗi request.
+- `errs.Is` quét **toàn bộ** chuỗi lỗi (kể cả qua `errors.Join`), còn `errs.As` trả
+  **lớp ngoài cùng** — lớp gần chỗ trả response nhất là phân loại đúng nhất cho client.
+- `errs.Register` là chỗ duy nhất có state toàn cục thay đổi được. Không tránh được:
+  một `*Error` tạo ở tầng repository không có đường cầm theo registry. Bù lại nó chỉ
+  dành cho lúc khởi tạo, và panic ngay nếu tham số sai.
+- `errs.New` với mã lỗi chưa đăng ký trả HTTP 500 thay vì panic — một mã viết sai
+  không được phép làm sập request đang xử lý.
 
 > **Cổng chặn:** API của `core` phải **đóng băng** trước khi sang Phase 3. Trong thiết kế multi-module, sửa breaking change ở `core` nghĩa là release `core`, rồi bump require + release lần lượt 6 module còn lại.
 
