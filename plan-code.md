@@ -11,8 +11,8 @@ Ký hiệu: `⬜` chưa làm · `🔄` đang làm · `✅` xong
 
 | Phase | Nội dung | Trạng thái |
 |---|---|---|
-| 0 | Bộ khung repo, go.mod, go.work, CI | ⬜ |
-| 1 | `core` — log/errs/config/trace/crypto... | ⬜ |
+| 0 | Bộ khung repo, go.mod, go.work, CI | ✅ |
+| 1 | `core` — log/errs/config/trace/crypto... | 🔄 |
 | 2 | `obs` + `httpx` — middleware, server, client | ⬜ |
 | 3 | `db` + `cache` + `testx` | ⬜ |
 | 4 | `kafka` | ⬜ |
@@ -1048,15 +1048,28 @@ Module này là thứ khiến bộ lib **thực sự được dùng**: nếu ng�
 
 ## 5. Lộ trình implement
 
-### Phase 0 — Bộ khung `⬜`
+### Phase 0 — Bộ khung `✅`
 
 - [x] Đổi tên folder local `go-libs` → `gokit`, cập nhật remote URL
-- [ ] Đổi tên repo GitHub `go-libs` → `gokit` (Settings → Repository name)
-- [ ] 8 file `go.mod` + `go.work` (không commit `go.work.sum`)
-- [ ] `.golangci.yml`, `Makefile` (`make test`, `make lint`, `make test-integration`)
-- [ ] CI: matrix theo module; **1 job riêng chạy `GOWORK=off`**
-- [ ] CI: bước grep chặn module path viết hoa `CQT002`
-- [ ] `README.md`
+- [x] Đổi tên repo GitHub `go-libs` → `gokit` (Settings → Repository name)
+- [x] 8 file `go.mod` + `go.work` (`go.work.sum` đã vào `.gitignore`)
+- [x] `.golangci.yml`, `Makefile` (`make test`, `make lint`, `make test-integration`)
+- [x] CI: matrix theo module; **1 job riêng chạy `GOWORK=off`**
+- [x] CI: bước grep chặn module path viết hoa `CQT002` (`scripts/check-module-path.sh`)
+- [x] `README.md`
+
+Chốt trong lúc làm:
+
+| Hạng mục | Giá trị | Ghi chú |
+|---|---|---|
+| Go tối thiểu | `go 1.25.0` ở cả 8 `go.mod` | CI test matrix `1.25.x` × `stable` |
+| golangci-lint | `v2.13.0`, pin ở `Makefile` + CI | v2.6.x không đọc được export data của Go 1.27 |
+| CI | GitHub Actions — job `guard`, `test`, `lint`, `nowork`, `tidy`, `integration` | `integration` chỉ chạy nightly/dispatch |
+| Build khi `GOWORK=off` | `go build -o /dev/null ./...` | `-o dir/` đòi main package; `./...` trần thì đụng thư mục `examples/api` |
+
+> Còn một việc bằng tay: remote URL của `origin` vẫn đang viết hoa tên user. Chạy
+> `git remote set-url origin https://github.com/cqt002/gokit.git` cho khớp module path.
+> (Guard `check-module-path` quét cả `*.md`, nên đừng viết dạng viết hoa vào file này.)
 
 ### Phase 1 — `core` `⬜`
 
