@@ -27,8 +27,12 @@ linters:
     revive:
       rules:
         # Mọi symbol export phải có godoc — yêu cầu "định nghĩa xong" của plan.
+        #
+        # Không bật checkPrivateReceivers: nó đòi godoc cho method của type
+        # unexported, mà những method đó không xuất hiện trong godoc nên comment
+        # chỉ phục vụ linter. Chuẩn đã chốt là "godoc cho mọi symbol export".
         - name: exported
-          arguments: [checkPrivateReceivers, disableStutteringCheck]
+          arguments: [disableStutteringCheck]
         - name: package-comments
         - name: context-as-argument
         - name: error-strings

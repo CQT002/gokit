@@ -20,12 +20,17 @@ Multi-module — mỗi thành phần là một module riêng để service chỉ
 | [httpx](httpx/) | middleware, server, client, auth, idempotency, health |
 | [db](db/) | GORM (Postgres/MySQL), base entity, query builder, migrate |
 | [cache](cache/) | Redis, distributed lock, leader election, cron |
-| [kafka](kafka/) | producer/consumer trên franz-go |
+| [queue/kafka](queue/kafka/) | producer/consumer trên franz-go |
 | [testx](testx/) | helper cho test (testcontainers, log capture) |
 | [examples](examples/) | service mẫu — nơi kiểm chứng thiết kế |
 
 Phụ thuộc một chiều: `core` và `obs` không phụ thuộc gì trong repo; `httpx`, `db`,
-`cache`, `kafka` phụ thuộc `core` + `obs`.
+`cache`, `queue/kafka` phụ thuộc `core` + `obs`.
+
+`queue/` là thư mục thường, không phải module — nó chỉ là chỗ đứng cho driver thứ hai
+sau này (`queue/rabbitmq`, `queue/sqs`) mà không bắt người dùng driver đó kéo theo
+dependency của Kafka. Không có interface chung phủ các driver: mô hình của chúng khác
+nhau ở đúng chỗ quan trọng nhất.
 
 ## Cài đặt
 
@@ -34,6 +39,7 @@ Mỗi module cài riêng, và **tag có prefix theo tên module**:
 ```sh
 go get github.com/cqt002/gokit/core@core/v0.1.0
 go get github.com/cqt002/gokit/httpx@httpx/v0.1.0
+go get github.com/cqt002/gokit/queue/kafka@queue/kafka/v0.1.0
 ```
 
 Yêu cầu Go 1.25 trở lên.

@@ -4,7 +4,7 @@
 SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
-MODULES := core obs httpx db cache kafka testx examples
+MODULES := core obs httpx db cache queue/kafka testx examples
 GOLANGCI_VERSION := v2.13.0
 GOLANGCI := $(shell command -v golangci-lint 2>/dev/null)
 ifeq ($(GOLANGCI),)
@@ -39,13 +39,13 @@ cover: ## Coverage từng module, in tổng %
 .PHONY: lint
 lint: ## golangci-lint mọi module
 	@set -e; for m in $(MODULES); do \
-		echo "==> lint $$m"; (cd $$m && $(GOLANGCI) run --config=../.golangci.yml ./...); \
+		echo "==> lint $$m"; (cd $$m && $(GOLANGCI) run --config=$(CURDIR)/.golangci.yml ./...); \
 	done
 
 .PHONY: fmt
 fmt: ## gofmt + tổ chức lại import
 	@set -e; for m in $(MODULES); do \
-		(cd $$m && $(GOLANGCI) fmt --config=../.golangci.yml ./...); \
+		(cd $$m && $(GOLANGCI) fmt --config=$(CURDIR)/.golangci.yml ./...); \
 	done
 
 .PHONY: vet
@@ -63,11 +63,15 @@ tidy: ## go mod tidy mọi module
 .PHONY: tidy-check
 tidy-check: ## Fail nếu go.mod/go.sum chưa tidy (dùng trong CI)
 	@set -e; for m in $(MODULES); do \
-		(cd $$m && cp go.mod go.mod.bak && { [ -f go.sum ] && cp go.sum go.sum.bak || true; } \
-			&& go mod tidy \
-			&& { diff -q go.mod go.mod.bak >/dev/null || { echo "$$m: go.mod chưa tidy"; exit 1; }; } \
-			&& { [ ! -f go.sum.bak ] || diff -q go.sum go.sum.bak >/dev/null || { echo "$$m: go.sum chưa tidy"; exit 1; }; } \
-			&& mv go.mod.bak go.mod && { [ -f go.sum.bak ] && mv go.sum.bak go.sum || true; }); \
+		( cd $$m; \
+		  cp go.mod .go.mod.bak; \
+		  if [ -f go.sum ]; then cp go.sum .go.sum.bak; fi; \
+		  trap 'mv .go.mod.bak go.mod; if [ -f .go.sum.bak ]; then mv .go.sum.bak go.sum; else rm -f go.sum; fi' EXIT; \
+		  go mod tidy; \
+		  diff -q go.mod .go.mod.bak >/dev/null || { echo "$$m: go.mod chưa tidy — chạy make tidy"; exit 1; }; \
+		  if [ -f .go.sum.bak ]; then \
+		    diff -q go.sum .go.sum.bak >/dev/null || { echo "$$m: go.sum chưa tidy — chạy make tidy"; exit 1; }; \
+		  fi ); \
 	done
 	@echo "OK: mọi module đã tidy"
 

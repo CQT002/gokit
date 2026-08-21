@@ -12,10 +12,10 @@ Ký hiệu: `⬜` chưa làm · `🔄` đang làm · `✅` xong
 | Phase | Nội dung | Trạng thái |
 |---|---|---|
 | 0 | Bộ khung repo, go.mod, go.work, CI | ✅ |
-| 1 | `core` — log/errs/config/trace/crypto... | 🔄 |
+| 1 | `core` — log/errs/config/trace/crypto... | ✅ |
 | 2 | `obs` + `httpx` — middleware, server, client | ⬜ |
 | 3 | `db` + `cache` + `testx` | ⬜ |
-| 4 | `kafka` | ⬜ |
+| 4 | `queue/kafka` | ⬜ |
 | 5 | Hoàn thiện, godoc, tag version | ⬜ |
 
 Chi tiết từng hạng mục ở [mục 5](#5-lộ-trình-implement). Làm xong hạng mục nào thì tick checkbox ở đó và cập nhật bảng này.
@@ -45,6 +45,10 @@ Nguyên tắc thiết kế:
 | Cấu trúc | Multi-module (8 module trong 1 repo) | Cách ly dependency nặng |
 | HTTP | `net/http` thuần, **không phụ thuộc router** | Middleware `func(http.Handler) http.Handler` dùng được ở mọi router; Echo tiêu thụ được stdlib chứ không ngược lại |
 | Kafka | `twmb/franz-go` | Pure Go, bảo trì tích cực, tự xử lý reconnect/metadata, có `kprom` cho metrics sẵn |
+| Vị trí module Kafka | `queue/kafka`, **không** phải `kafka` | Module path là API công khai: sau khi tag `kafka/v0.1.0` thì đổi path là breaking change cho mọi importer, còn path cũ vẫn nằm mãi trong proxy. Driver thứ hai (RabbitMQ/SQS/NATS) mang cây dependency riêng và API khác hẳn, không thể nằm chung module với Kafka |
+| `queue/` là gì | **Thư mục thường**, không phải module | Nếu `queue` là module rồi `queue/kafka` là subpackage thì franz-go lây sang mọi người import `queue` — phá đúng lý do chọn multi-module |
+| Interface chung cho queue | **Không làm** (xem mục 7) | Kafka có partition/offset/consumer group/commit tay; RabbitMQ có exchange/ack/prefetch; SQS có visibility timeout. Mẫu số chung `Publish(topic, msg)` bỏ mất đúng những thứ khiến người ta chọn Kafka |
+| `db` và `cache` giữ phẳng | Không đổi thành `db/gorm`, `cache/redis` | GORM **đã là** lớp abstract driver (postgres/mysql trong cùng module). Còn `cache/lock`, `cache/leader`, `cache/cron` bản chất là redis-specific (redislock, `SET NX`) — thêm một tầng thư mục không mở ra khả năng nào thật |
 | Config | `yaml.v3` + `sethvargo/go-envconfig` | 2 deps thay vì 13 của viper; không global state; env override grep được |
 | Observability | Prometheus metrics + trace ID chuẩn W3C (chưa cài OTel SDK) | Metrics rẻ và giá trị cao; format trace ID là thứ gần như không đổi được về sau |
 | Masking log | **3 lớp**: chặn theo kích thước → tag `log:` trên struct → danh sách tên field (fallback) | Luật theo kích thước an toàn mặc định; tag đi cùng field nên không lệch pha |
@@ -105,8 +109,9 @@ gokit/
 │   ├── idemstore/             # store Redis cho httpx/idempotency
 │   └── deps: core, obs, go-redis/v9, redislock
 │
-├── kafka/         go.mod → .../kafka
-│   └── deps: core, obs, franz-go, franz-go/plugin/kprom
+├── queue/                     # thư mục thường, KHÔNG có go.mod ở đây
+│   └── kafka/     go.mod → .../queue/kafka
+│       └── deps: core, obs, franz-go, franz-go/plugin/kprom
 │
 ├── testx/         go.mod → .../testx
 │   └── deps: testcontainers-go, testify
@@ -118,11 +123,11 @@ gokit/
 **Đồ thị phụ thuộc** (một chiều, không có cycle):
 
 ```
-core ← httpx ← ─┐
-core ← db   ← ─ ┤
-core ← cache ←  ├─ examples/api
-core ← kafka ←  ┘
-obs  ← {httpx, db, cache, kafka}
+core ← httpx       ← ─┐
+core ← db          ← ─┤
+core ← cache       ← ─├─ examples/api
+core ← queue/kafka ← ─┘
+obs  ← {httpx, db, cache, queue/kafka}
 httpx/idempotency ← cache/idemstore     (interface ở httpx, impl ở cache)
 testx ← (chỉ dùng trong test)
 ```
@@ -947,7 +952,16 @@ Implementation Redis cho `httpx/idempotency.Store`. Dùng `SET NX` để reserve
 
 ---
 
-### 4.16 `kafka`
+### 4.16 `queue/kafka`
+
+Đường dẫn module là `github.com/cqt002/gokit/queue/kafka`. Không có package nào ở
+`queue/` — chỗ đó chỉ là namespace để driver thứ hai sau này (`queue/rabbitmq`,
+`queue/sqs`) có nhà, mà không kéo theo dependency của Kafka.
+
+Phần dùng chung giữa các driver **đã được factor sẵn** ở `core/tracectx`: propagate
+trace qua header là cùng một cơ chế cho HTTP và cho mọi broker. Nếu về sau phát hiện
+thêm phần chung thật thì tạo `queue/queue` — thêm package mới không breaking, còn đổi
+đường dẫn module thì breaking.
 
 ```go
 type SASLMechanism string
@@ -1058,6 +1072,20 @@ Module này là thứ khiến bộ lib **thực sự được dùng**: nếu ng�
 - [x] CI: bước grep chặn module path viết hoa `CQT002` (`scripts/check-module-path.sh`)
 - [x] `README.md`
 
+**Việc phát sinh — di chuyển `kafka/` → `queue/kafka/`** (xem lý do ở mục 2). Làm
+trước khi có tag đầu tiên: sau khi tag rồi thì đây là breaking change cho mọi importer.
+
+- [x] `git mv kafka queue/kafka`; module path → `github.com/cqt002/gokit/queue/kafka`
+- [x] `go.work`: `use ./queue/kafka`
+- [x] `Makefile`: `MODULES` đổi `kafka` → `queue/kafka`
+- [x] `Makefile`: **`--config=../.golangci.yml` → `$(CURDIR)/.golangci.yml`** ở target
+      `lint` và `fmt`. Với module lồng một tầng, `../` trỏ vào `queue/` chứ không phải
+      gốc repo, lint sẽ fail vì không thấy config. CI không bị vì đã dùng
+      `${{ github.workspace }}`
+- [x] CI `ci.yml`: matrix `module` đổi `kafka` → `queue/kafka` ở cả job `test` và `lint`
+- [x] `README.md`: bảng module + giải thích tầng `queue/`
+- [x] Kiểm chứng: `make check` + `make build-nowork` + `make tidy-check` đều xanh
+
 Chốt trong lúc làm:
 
 | Hạng mục | Giá trị | Ghi chú |
@@ -1066,12 +1094,14 @@ Chốt trong lúc làm:
 | golangci-lint | `v2.13.0`, pin ở `Makefile` + CI | v2.6.x không đọc được export data của Go 1.27 |
 | CI | GitHub Actions — job `guard`, `test`, `lint`, `nowork`, `tidy`, `integration` | `integration` chỉ chạy nightly/dispatch |
 | Build khi `GOWORK=off` | `go build -o /dev/null ./...` | `-o dir/` đòi main package; `./...` trần thì đụng thư mục `examples/api` |
+| revive `exported` | Bỏ `checkPrivateReceivers` | Nó đòi godoc cho method của type unexported — những method không có mặt trong godoc, nên comment chỉ phục vụ linter. Chuẩn đã chốt là "godoc cho mọi symbol export" |
+| `make tidy-check` | Restore bằng `trap ... EXIT` | Bản đầu `exit 1` trước bước restore, nên khi fail nó để lại `go.mod` đã bị sửa và file `.bak` trên đĩa. Đã kiểm chứng hai chiều: pass khi tidy, fail mà không để lại dấu vết khi không tidy |
 
 > Còn một việc bằng tay: remote URL của `origin` vẫn đang viết hoa tên user. Chạy
 > `git remote set-url origin https://github.com/cqt002/gokit.git` cho khớp module path.
 > (Guard `check-module-path` quét cả `*.md`, nên đừng viết dạng viết hoa vào file này.)
 
-### Phase 1 — `core` `🔄`
+### Phase 1 — `core` `✅`
 
 Thứ tự bắt buộc (do phụ thuộc):
 
@@ -1080,14 +1110,14 @@ Thứ tự bắt buộc (do phụ thuộc):
 - [x] `tracectx` (phụ thuộc `idx`)
 - [x] `ctxmeta`
 - [x] `errs`
-- [ ] `log` — handler chain + **masking lớp 1** (elide theo kích thước)
-- [ ] `log` — **masking lớp 2** (`Safe` đọc tag `log:`, cache theo `reflect.Type`)
-- [ ] `log` — **masking lớp 3** (`SafeMap` theo tên field) + trần `MaxLineBytes`
-- [ ] `config` (phụ thuộc `secret`)
-- [ ] `crypto` — AES-GCM + key rotation, HMAC, argon2id
-- [ ] `retry`
-- [ ] `tlsx`
-- [ ] `timex`
+- [x] `log` — handler chain + **masking lớp 1** (elide theo kích thước)
+- [x] `log` — **masking lớp 2** (`Safe` đọc tag `log:`, cache theo `reflect.Type`)
+- [x] `log` — **masking lớp 3** (`SafeMap` theo tên field) + trần `MaxLineBytes`
+- [x] `config` (phụ thuộc `secret`)
+- [x] `crypto` — AES-GCM + key rotation, HMAC, argon2id
+- [x] `retry`
+- [x] `tlsx`
+- [x] `timex`
 
 **Định nghĩa "xong":** coverage ≥ 80%, không cần Docker, godoc đầy đủ cho mọi symbol export.
 
@@ -1097,8 +1127,18 @@ lại khi đóng băng API cuối Phase 1:
 | Package | Thêm | Lý do |
 |---|---|---|
 | `secret` | `MarshalYAML`, `IsZero`, `Equal` | Dump config ra YAML là đường lộ ngang hàng với JSON. `Equal` dùng `subtle.ConstantTimeCompare` — `httpx/auth` so khớp API key cần đúng thứ này, để mỗi service tự viết `==` là hở kênh phụ |
-| `tracectx` | `Valid`, `String`, `TraceIDFrom`, `HeaderTraceparent`, `ErrInvalidTraceparent` | `Valid` là điều kiện dùng chung của `Traceparent`/`NewChild`; `HeaderTraceparent` để `httpx` và `kafka` không tự viết lại tên header |
+| `tracectx` | `Valid`, `String`, `TraceIDFrom`, `HeaderTraceparent`, `ErrInvalidTraceparent` | `Valid` là điều kiện dùng chung của `Traceparent`/`NewChild`; `HeaderTraceparent` để `httpx` và `queue/kafka` không tự viết lại tên header |
 | `errs` | `HTTPStatus(err)`, `WithCause`, `opts` cho `Wrap` | `httpx.Fail` cần lấy status từ error bất kỳ, kể cả error thường (→ 500) |
+| `log` | `MaskConfig.DisableElideHash` thay cho `HashElide` | Cùng hành vi, nhưng bool zero trong Go là `false` nên chỉ chiều phủ định giữ được mặc định "có hash" khi không khai gì |
+| `log` | `AttrUserType` (`user_type`) trong ContextHandler | `ctxmeta.Meta` đã có field này; đính thêm gần như miễn phí |
+| `log` | `Elided`, `LabelBase64/DataURI/Text`, `DefaultMaskFields()`, `NewMaskHandler` | Hình dạng metadata và danh sách field mặc định là thứ test của service cần assert được |
+| `config` | `Lookuper` định nghĩa lại trong package, không dùng `envconfig.Lookuper` | Không để đường dẫn import của thư viện env lọt vào API công khai — đổi thư viện về sau sẽ không phải breaking change. Hai interface giống hệt nhau nên gán trực tiếp được |
+| `crypto` | `NewCipherWithKeys`, `Key`, `PrimaryKeyID`, `KeyIDs` | Đặc tả yêu cầu key rotation nhưng chỉ có `NewCipher(key)` — cần đường khai nhiều khoá |
+| `crypto` | `SetDefaultCipher`, `DefaultCipher`, `ErrNoCipher` | `Encrypted.Value()`/`Scan()` do GORM gọi, không nhận tham số nào, nên cipher phải đến từ chỗ method tìm được |
+| `crypto` | `Encrypted.String/GoString/MarshalJSON/Reveal` | Đặc tả chỉ có `LogValue`, nhưng `fmt.Sprintf("%+v", model)` và `json.Marshal(model)` là hai đường lộ PII ngang hàng với log |
+| `crypto` | `NeedsRehash` | Ghi tham số vào chuỗi hash chỉ có ích nếu phát hiện được hash cũ để nâng cấp |
+| `retry` | `DefaultRetryable` và các hằng `Default*` | Chỗ gọi cần bọc lại luật mặc định thay vì viết lại từ đầu |
+| `tlsx` | `ErrConflictingSources` | Khai nhiều nguồn cho cùng một vật liệu là lỗi cấu hình, chỗ gọi cần phân biệt được nó với lỗi đọc file |
 
 Quyết định đáng ghi lại:
 
@@ -1114,6 +1154,78 @@ Quyết định đáng ghi lại:
   dành cho lúc khởi tạo, và panic ngay nếu tham số sai.
 - `errs.New` với mã lỗi chưa đăng ký trả HTTP 500 thay vì panic — một mã viết sai
   không được phép làm sập request đang xử lý.
+
+Quyết định của `core/log`:
+
+- **Thứ tự ưu tiên khi nhiều lớp cùng áp vào một giá trị:** tag (lớp 2) → tên field
+  (lớp 3) → kích thước (lớp 1). Lớp 1 áp cả lên kết quả của lớp 2: `log:"truncate=1000"`
+  với `MaxLen` 256 thì vẫn bị elide. Lưới an toàn có ngoại lệ thì không còn là lưới —
+  muốn giữ dài hơn thì nâng `MaxLen`.
+- **`MaskConfig.Fields` được trộn vào `DefaultMaskFields`, không thay thế.** Khai một
+  field riêng của app mà vô tình tắt việc che `password` là đúng cái cách log lộ mật
+  khẩu mà không ai nhận ra. Trùng tên thì bản khai tay thắng.
+- **So khớp tên field không phân biệt hoa thường, coi `-` như `_`**, nên `Authorization`,
+  `api-key`, `API_KEY` đều khớp.
+- **Tag sai cú pháp bị coi là `redact`.** Che chặt hơn ý muốn là hướng sai an toàn, và
+  output `********` thay vì giá trị mong đợi là thứ test nhận ra ngay.
+- **Cắt chuỗi theo rune, không theo byte** (`truncate`, `edges`). Cắt giữa một ký tự
+  UTF-8 làm dòng log chứa byte không hợp lệ, mà tiếng Việt thì ký tự nào cũng nhiều byte.
+  Cùng lý do, ngưỡng `MaxLen` chỉ tính là vượt khi vượt **cả** theo byte lẫn theo rune.
+- **`edges` trên giá trị ngắn hơn `p+s` thì che sạch**, không để lộ nguyên giá trị chỉ
+  vì nó ngắn hơn dự kiến. Số dấu sao chặn ở 32 để chuỗi dài không thành hàng nghìn dấu sao.
+- **`RuleHash` chỉ an toàn với giá trị đủ entropy.** sha256 của OTP 6 số hay số thẻ 16
+  số bị dò ngược trong vài giây; những giá trị đó phải dùng `redact` hoặc `edges`. Đã
+  ghi cảnh báo này trong godoc của `RuleHash`.
+- **`MaxLen` có sàn 16.** Chuỗi thay thế do chính cơ chế che sinh ra (`[REDACTED]` dài
+  10 byte) không được biến thành metadata elide.
+- **Trần dòng log bỏ attribute lớn nhất trước**, lặp tới khi lọt trần. Nhờ vậy
+  `trace_id`, `status`, `method` là những thứ sống sót cuối cùng — mất body còn tra được
+  request, mất cả dòng thì không.
+- **Kích thước dòng log là ước lượng theo byte thô**, chưa tính phần escape của JSON. Đo
+  chính xác đòi serialize hai lần cho mọi dòng log. Bù lại bằng cách đặt `MaxLineBytes`
+  thấp hơn giới hạn thật của backend.
+- **`SafeMap` trả về dữ liệu thuần** (`map`, `string`, số) chứ không phải type của gokit,
+  nên payload đã che có thể đem marshal bằng encoder nào cũng được.
+- **Trải phẳng struct nhúng giống `encoding/json`**, kể cả khi type nhúng là unexported:
+  bản thân field nhúng không lấy được qua `Interface()` nhưng các field export bên trong
+  thì lấy được, và bỏ qua sẽ làm log thiếu field so với body thật.
+- **Sắp xếp key của map trước khi ghi.** Thứ tự lặp map trong Go là ngẫu nhiên; không sắp
+  thì golden test vô dụng.
+- **Đệ quy chặn ở độ sâu 32.** Một struct trỏ vòng lại chính nó không được phép làm sập
+  process — logger là thứ cuối cùng được phép gây sự cố.
+
+Quyết định của 5 package cuối:
+
+- **`config` bật `DefaultOverwrite` của envconfig.** Mặc định của thư viện là **không**
+  ghi đè field đã có giá trị, nghĩa là mọi field khai trong YAML sẽ miễn nhiễm với biến
+  môi trường — mất hẳn thứ tự ưu tiên mà package hứa. Đã kiểm chứng bằng test.
+- **Thứ tự ưu tiên đầy đủ: env > YAML > `default=` trong tag > zero.** `default=` **không**
+  ghi đè YAML dù đã bật `DefaultOverwrite`, vì envconfig chỉ ghi đè khi biến thực sự có
+  mặt. Có test khoá hành vi này lại.
+- **Key lạ trong YAML là lỗi** (`KnownFields(true)`). Một key gõ sai bị im lặng bỏ qua là
+  kiểu sự cố tốn nhiều giờ nhất của config loader: cấu hình trông như đã khai mà thực tế
+  đang chạy giá trị mặc định.
+- **Blob của `crypto.Cipher` mang ID khoá, và ID đó nằm trong AAD của GCM.** Không xác thực
+  ID thì ai cũng sửa được ID trong blob để lừa hệ thống giải mã bằng khoá khác. Có test
+  đổi ID và test lật từng byte một ở mọi vị trí.
+- **`crypto` không cho cấu hình tham số nào ảnh hưởng độ an toàn.** Thuật toán, kích thước
+  nonce, tham số argon2 cố định trong code. Tham số quá thấp làm hash bị brute force, và
+  người khai thường không có cơ sở để chọn khác.
+- **`RuleHash`/`crypto` cảnh báo về entropy:** sha256 của OTP 6 số hay số thẻ 16 số bị dò
+  ngược trong vài giây. Đã ghi trong godoc.
+- **Mật khẩu rỗng bị từ chối ngay khi hash.** Nếu hash được thì `VerifyPassword("")` trả
+  true, và đó là đường vào hệ thống không cần mật khẩu.
+- **Lỗi giải mã không kể chi tiết của GCM** — chi tiết đó không giúp debug mà lại nói cho
+  người thử tấn công biết họ sai ở đâu.
+- **`tlsx` coi việc khai nhiều nguồn cho cùng một vật liệu là lỗi**, không phải thứ tự ưu
+  tiên. Khi cert trên đĩa khác cert trong env, đoán xem cái nào thắng là tự tạo sự cố.
+- **`retry.Jitter` chưa khai thì dùng mặc định 0.2, muốn tắt phải khai số âm.** Bất đối
+  xứng có chủ ý: mất jitter làm hỏng đúng tính chất package tồn tại để bảo đảm, còn bị
+  jitter khi không mong đợi thì không gây hại gì.
+- **`retry` gộp lỗi bằng `errors.Join` khi context kết thúc giữa lúc chờ**, để `errors.Is`
+  kiểm tra được cả lý do đang thử lại và lý do dừng.
+- **`timex` giữ nguyên location trong `StartOfDay`/`EndOfDay`.** Với giờ sát nửa đêm, đổi
+  sang UTC làm lệch hẳn một ngày.
 
 > **Cổng chặn:** API của `core` phải **đóng băng** trước khi sang Phase 3. Trong thiết kế multi-module, sửa breaking change ở `core` nghĩa là release `core`, rồi bump require + release lần lượt 6 module còn lại.
 
@@ -1153,7 +1265,7 @@ Test bằng `httptest`, không cần Docker.
 
 Phase này CI cần Docker. Test integration để sau build tag `integration`.
 
-### Phase 4 — `kafka` `⬜`
+### Phase 4 — `queue/kafka` `⬜`
 
 - [ ] `Producer` (sync + async), SASL/TLS
 - [ ] Propagate trace qua Kafka header
@@ -1166,7 +1278,7 @@ Phase này CI cần Docker. Test integration để sau build tag `integration`.
 
 - [ ] Godoc mọi symbol export + `Example` function
 - [ ] `examples/`: consumer, cron job
-- [ ] Tag `core/v0.1.0`, `obs/v0.1.0`, ... (**tag có prefix theo tên module**)
+- [ ] Tag `core/v0.1.0`, `obs/v0.1.0`, `queue/kafka/v0.1.0`, ... (**prefix là đường dẫn module tính từ gốc repo**, nên module lồng thì tag cũng lồng)
 - [ ] `CHANGELOG.md` mỗi module
 - [ ] `docs/adr/` — ghi lại lý do các quyết định
 - [ ] Giữ ở `v0.x` cho tới khi API ổn định — `v1` là lời hứa tương thích
@@ -1181,7 +1293,7 @@ Phase này CI cần Docker. Test integration để sau build tag `integration`.
 |---|---|---|---|
 | Unit | toàn bộ `core`, `obs`, `httpx` (qua `httptest`) | Không | Mọi commit |
 | Golden | định dạng JSON của log, shape của `Envelope` | Không | Mọi commit |
-| Integration | `db`, `cache`, `kafka` (testcontainers) | Có | PR + nightly |
+| Integration | `db`, `cache`, `queue/kafka` (testcontainers) | Có | PR + nightly |
 | Race | `go test -race` toàn bộ | Không | Mọi commit |
 
 Ưu tiên test cho những chỗ dễ sai nhất:
@@ -1213,6 +1325,7 @@ Phase này CI cần Docker. Test integration để sau build tag `integration`.
 | Hạng mục | Lý do |
 |---|---|
 | DI container | Wiring bằng constructor rõ ràng hơn; DI container che mất đồ thị phụ thuộc và fail lúc runtime thay vì compile time |
+| Interface chung cho `queue/*` (`Publisher`, `Subscriber`) | Mô hình của các broker khác nhau ở đúng chỗ quan trọng: partition/offset/commit tay của Kafka, exchange/ack/prefetch của RabbitMQ, visibility timeout của SQS. Một interface phủ hết chúng chỉ còn `Publish(topic, msg)` — bỏ mất lý do người ta chọn broker đó. Thư mục `queue/` là namespace, không phải abstraction |
 | Oracle, SQL Server | CGO của `godror` gây khổ cho build/CI; không có nhu cầu |
 | `sqlx` | Không cần Oracle/MSSQL nữa; Postgres thì `pgx` trực tiếp tốt hơn |
 | Object mapper tự động (`copier`) | Bỏ lỗi im lặng. Map tay hoặc dùng codegen (`goverter`) |

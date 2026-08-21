@@ -6,7 +6,7 @@ use (
 	./db
 	./examples
 	./httpx
-	./kafka
 	./obs
+	./queue/kafka
 	./testx
 )

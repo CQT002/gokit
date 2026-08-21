@@ -37,7 +37,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [core, obs, httpx, db, cache, kafka, testx, examples]
+        module: [core, obs, httpx, db, cache, queue/kafka, testx, examples]
         go: ["1.25.x", "stable"]
     steps:
       - uses: actions/checkout@v5
@@ -63,7 +63,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [core, obs, httpx, db, cache, kafka, testx, examples]
+        module: [core, obs, httpx, db, cache, queue/kafka, testx, examples]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
