@@ -13,7 +13,7 @@ Ký hiệu: `⬜` chưa làm · `🔄` đang làm · `✅` xong
 |---|---|---|
 | 0 | Bộ khung repo, go.mod, go.work, CI | ✅ |
 | 1 | `core` — log/errs/config/trace/crypto... | ✅ |
-| 2 | `obs` + `httpx` — middleware, server, client | ⬜ |
+| 2 | `obs` + `httpx` — middleware, server, client | ✅ |
 | 3 | `db` + `cache` + `testx` | ⬜ |
 | 4 | `queue/kafka` | ⬜ |
 | 5 | Hoàn thiện, godoc, tag version | ⬜ |
@@ -1229,24 +1229,111 @@ Quyết định của 5 package cuối:
 
 > **Cổng chặn:** API của `core` phải **đóng băng** trước khi sang Phase 3. Trong thiết kế multi-module, sửa breaking change ở `core` nghĩa là release `core`, rồi bump require + release lần lượt 6 module còn lại.
 
-### Phase 2 — `obs` + `httpx` `⬜`
+### Phase 2 — `obs` + `httpx` `✅`
 
-- [ ] `obs`: registry, `/metrics`, `HTTPMetrics`, `RegisterDBStats`, `RegisterRuntime`
-- [ ] `httpx/middleware`: `Trace`
-- [ ] `httpx/middleware`: `AccessLog`, `Recover`, `Timeout`, `CORS`, `MaxBodySize`
-- [ ] `httpx/middleware`: `BodyLog` — holder trong context + fallback `SafeMap`
-- [ ] `httpx/middleware`: `RateLimit` (in-process)
-- [ ] `httpx`: `Envelope`, `Decode[T]` (+ đăng ký body đã mask), `OK`/`Created`/`Fail`
-- [ ] `httpx`: error mapper từ `errs`
-- [ ] `httpx/validate`: rule cắm thêm được
-- [ ] `httpx/auth`: JWT, APIKey, BasicAuth
-- [ ] `httpx/health`: `/healthz`, `/readyz`
-- [ ] `httpx`: `Server` + `App` lifecycle (graceful shutdown)
-- [ ] `httpx/client`: retry + breaker + propagate trace + mask log
-- [ ] `httpx/idempotency`: middleware + `Store` interface + store in-memory
-- [ ] `examples/api`: service chạy được thật — **nơi kiểm chứng thiết kế**
+- [x] `obs`: registry, `/metrics`, `HTTPMetrics`, `RegisterDBStats`, `RegisterRuntime`
+- [x] `httpx/middleware`: `Trace`
+- [x] `httpx/middleware`: `AccessLog`, `Recover`, `Timeout`, `CORS`, `MaxBodySize`
+- [x] `httpx/middleware`: `BodyLog` — holder trong context + fallback `SafeMap`
+- [x] `httpx/middleware`: `RateLimit` (in-process)
+- [x] `httpx`: `Envelope`, `Decode[T]` (+ đăng ký body đã mask), `OK`/`Created`/`Fail`
+- [x] `httpx`: error mapper từ `errs`
+- [x] `httpx/validate`: rule cắm thêm được
+- [x] `httpx/auth`: JWT, APIKey, BasicAuth
+- [x] `httpx/health`: `/healthz`, `/readyz`
+- [x] `httpx`: `Server` + `App` lifecycle (graceful shutdown)
+- [x] `httpx/client`: retry + breaker + propagate trace + mask log
+- [x] `httpx/idempotency`: middleware + `Store` interface + store in-memory
+- [x] `examples/api`: service chạy được thật — **nơi kiểm chứng thiết kế**
+
+Coverage: `obs` 100%, `httpx` 88.1%. Chạy service mẫu thật (`ADDR=… go run ./api` + curl)
+là bước đã bắt được hai lỗi mà toàn bộ test unit không thấy — xem phần dưới.
 
 Test bằng `httptest`, không cần Docker.
+
+**`httpx` KHÔNG phụ thuộc `obs`** — khác đồ thị ở mục 3. `obs.HTTPMetrics` tự là một
+middleware nên app ghép nó vào chain; `httpx` không cần biết `obs` tồn tại. Ít một
+dependency, và `go mod tidy` là thứ phát hiện ra điều đó.
+
+**Cách xử lý module chưa publish:** `httpx/go.mod` và `examples/go.mod` khai `require`
+kèm `replace` trỏ vào cây nguồn trong repo, vì `core` chưa có bản nào trên proxy. Hệ quả
+cần biết: job `nowork` không còn kiểm được lệch version giữa các module nữa, chỉ còn
+kiểm thiếu `require` và lệch `go` directive. Bỏ `replace` và điền version thật ở Phase 5.
+
+Quyết định của Phase 2:
+
+- **`obs.HTTPOptions.RoutePattern` không mặc định về `r.URL.Path`.** Không khai thì nhãn
+  là `"unknown"`. Mặc định an toàn quan trọng hơn mặc định tiện: một scanner quét vài
+  nghìn URL lạ sẽ sinh vài nghìn series và làm Prometheus hết bộ nhớ.
+- **Có `obs.ServeMuxRoute`** vì `r.Pattern` của ServeMux gồm cả method (`GET /users/{id}`),
+  nên dùng thẳng nó sẽ nhân đôi thông tin đã có ở label `method`.
+- **`RegisterDBStats` đưa `name` vào constant label**, không phải variable label. Prometheus
+  so trùng collector theo tập `Desc`, nên hai database sẽ bị coi là trùng nếu dùng variable
+  label — test bắt được đúng lỗi này.
+- **`middleware.Timeout` không dùng `http.TimeoutHandler`** của stdlib vì nó buffer toàn bộ
+  response trong RAM. Thay bằng writer có mutex: hết hạn thì ghi 503 rồi khoá, handler ghi
+  tiếp nhận `http.ErrHandlerTimeout`. Nhờ vậy client nhận response **ngay tại mốc timeout**
+  thay vì phải chờ handler chịu dừng.
+- **`middleware.CORS` và `RateLimit` trả `error`.** Cấu hình CORS sai biểu hiện thành lỗi
+  trên trình duyệt của người dùng cuối, rất xa chỗ khai; `"*"` cùng `AllowCredentials` là
+  cấu hình trình duyệt từ chối theo đặc tả, nên phải lộ ra lúc dựng.
+- **`RateLimit` có trần số key bắt buộc.** Hạn mức theo IP với map không giới hạn là một
+  đường làm hết bộ nhớ, và người tấn công chỉ cần đổi IP nguồn.
+- **`Trace` mặc định KHÔNG tin request ID của client.** Tin nghĩa là client trộn được log
+  của mình vào log của request khác. ID nhận từ client bị lọc ký tự và cắt độ dài — một ký
+  tự xuống dòng trong đó là log injection.
+- **`BodyLog` không tự parse multipart.** Chỉ đọc metadata từ `r.MultipartForm` nếu handler
+  đã gọi `ParseMultipartForm`. Tự parse nghĩa là đọc hết body vào RAM hoặc đĩa tạm cho
+  **mọi** request upload chỉ để ghi log.
+- **`BodyLog` parse JSON với `UseNumber`.** Không có nó thì một ID 19 chữ số trong log thành
+  `1.2345678901234568e+18` — mất đúng những chữ số cần để tra cứu.
+- **`Decode` bật `DisallowUnknownFields`.** Client gửi `amout` thay vì `amount` mà server im
+  lặng bỏ qua rồi xử lý với số tiền 0 là kiểu sự cố tệ nhất trong nhóm này.
+- **`httpx.Fail` không bao giờ đưa `err.Error()` của error thường ra client** — nội dung đó
+  thường chứa tên host, câu SQL, đường dẫn file.
+- **`auth` từ chối thuật toán `none`, và bắt token dùng đúng thuật toán đã khai.** Có test
+  riêng cho lỗ hổng algorithm confusion ở cả nhánh ECDSA và RSA: token ký HMAC với khoá là
+  public key của server phải bị từ chối.
+- **`auth` đòi khoá HMAC tối thiểu 32 byte.** Khoá ngắn làm HMAC bị brute force, và đây là
+  loại sai không có triệu chứng nào cho tới khi bị khai thác.
+- **`/healthz` cố tình không kiểm tra dependency nào.** Nối liveness với database nghĩa là
+  database chập một nhịp sẽ làm Kubernetes restart toàn bộ pod cùng lúc — biến sự cố nhỏ
+  thành sự cố toàn hệ thống.
+- **`health.Ready` chạy checker song song và bọc `recover`** quanh từng checker: một checker
+  panic không được biến việc kiểm tra sức khoẻ thành nguyên nhân gây sự cố.
+- **`App` dừng thành phần theo thứ tự ngược thứ tự thêm**, và một thành phần lỗi làm cả app
+  dừng. Service còn HTTP sống nhưng consumer đã chết vẫn qua health check và vẫn nhận
+  traffic, trong khi nửa chức năng đã ngừng — thà chết hẳn để Kubernetes restart.
+- **`client.Do` giữ lại response của lần thử cuối.** `retry.DoValue` trả giá trị zero khi
+  lỗi, mà chi tiết của một lỗi 5xx nằm chính trong body đó. Và `statusError` chỉ là tín hiệu
+  nội bộ cho vòng retry, không phải lỗi trả ra — đã nhận được response thì không phải lỗi
+  "không gọi được". Test bắt được cả hai.
+- **`client` đọc hết body vào bộ nhớ** trước khi gửi, vì retry cần gửi lại: một `io.Reader`
+  đã đọc hết thì lần retry sẽ gửi body rỗng.
+- **`idempotency` chỉ lưu kết quả 2xx/3xx.** Lưu cả 5xx nghĩa là client retry sẽ nhận lại
+  đúng lỗi đó mãi dù nguyên nhân đã hết. Handler panic thì nhả khoá, nếu không client nhận
+  409 suốt TTL dù không có gì đang chạy.
+- **`idempotency` từ chối request khi Store lỗi** thay vì chạy tiếp: không biết request đã
+  chạy chưa thì chạy tiếp có thể tạo bản ghi trùng — đúng cái mà lớp này tồn tại để ngăn.
+
+**Hai lỗi chỉ chạy service mẫu thật mới phát hiện được** (test unit đều xanh trước đó):
+
+1. **Số thẻ lọt nguyên vẹn vào log ở đường idempotency phát lại.** Request phát lại không
+   chạy handler → không có `Decode` → không có bản mask theo tag → rơi về lớp 3, mà
+   `card_no` không nằm trong `DefaultMaskFields`. Fallback hoạt động đúng đặc tả, nhưng
+   **mặc định chưa an toàn**. Đã bổ sung nhóm thanh toán (`card_no`, `card_number`, `pan`,
+   `cvv`, `cvc`) và nhóm xác thực còn thiếu (`old_password`, `id_token`, `client_secret`,
+   `private_key`) vào danh sách mặc định của `core/log`.
+2. **Log response hiện cả field mà HTTP response đã bỏ** (`code:""`, `data:null`,
+   `elapsed_ms:0`), vì walk bằng reflect không tôn trọng `omitempty`. Đã sửa `core/log` để
+   tôn trọng nó — dòng log giờ có cùng hình dạng với JSON thật đi ra dây, đúng mục tiêu đã
+   ghi trong godoc.
+
+Một **data race thật trong code thư viện** do `-race` bắt: `Server.Addr()` là method công
+khai đọc field mà `Run()` ghi từ goroutine khác. Đã đổi sang `atomic.Pointer[string]`.
+
+Một góp ý đúng của linter đã tiếp nhận: `net.Listen` → `(*net.ListenConfig).Listen` để việc
+bind cũng tôn trọng context.
 
 ### Phase 3 — `db` + `cache` + `testx` `⬜`
 

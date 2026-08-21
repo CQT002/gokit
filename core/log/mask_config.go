@@ -111,19 +111,37 @@ type MaskConfig struct {
 //
 // Trả về bản copy mới mỗi lần gọi để chỗ gọi sửa thoải mái mà không ảnh hưởng
 // logger khác.
+//
+// Danh sách này là lưới cuối cùng cho những request **không** đi qua Decode — ví dụ
+// request bị middleware từ chối trước khi tới handler, hoặc request được
+// idempotency phát lại từ kết quả đã lưu. Ở những đường đó không có type nào để đọc
+// tag `log:`, nên tên field là thông tin duy nhất còn lại.
 func DefaultMaskFields() map[string]Rule {
 	return map[string]Rule{
+		// Thông tin xác thực.
 		"password":      RuleRedact,
 		"new_password":  RuleRedact,
+		"old_password":  RuleRedact,
 		"token":         RuleRedact,
 		"access_token":  RuleRedact,
 		"refresh_token": RuleRedact,
+		"id_token":      RuleRedact,
 		"otp":           RuleRedact,
 		"pin":           RuleRedact,
-		"cvv":           RuleRedact,
 		"secret":        RuleRedact,
+		"client_secret": RuleRedact,
 		"authorization": RuleRedact,
 		"api_key":       RuleRedact,
+		"private_key":   RuleRedact,
+
+		// Dữ liệu thanh toán. Che hẳn thay vì giữ 4 số cuối: ở đường fallback này
+		// không biết field thuộc nghiệp vụ nào, và che quá tay là hướng sai an toàn.
+		// Cần giữ 4 số cuối thì khai tag log:"edges=0,4" trên struct (lớp 2).
+		"card_no":     RuleRedact,
+		"card_number": RuleRedact,
+		"pan":         RuleRedact,
+		"cvv":         RuleRedact,
+		"cvc":         RuleRedact,
 	}
 }
 

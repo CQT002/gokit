@@ -164,6 +164,14 @@ func maskStruct(rv reflect.Value, cfg MaskConfig, depth int) []slog.Attr {
 	for _, f := range plan {
 		fv := rv.Field(f.index)
 
+		// Tôn trọng omitempty để dòng log có cùng hình dạng với JSON thật đi ra dây.
+		// Không có bước này, log một Envelope sẽ hiện cả code:"" và elapsed_ms:0 —
+		// những field mà client không bao giờ nhận, và người đọc log sẽ tưởng server
+		// đã trả về chúng.
+		if f.omitEmpty && !f.embed && fv.IsValid() && emptyForJSON(fv) {
+			continue
+		}
+
 		// Field nhúng không có tên json: trải phẳng vào cha, giống encoding/json,
 		// để dòng log có cùng hình dạng với body thật.
 		if f.embed {
@@ -295,11 +303,12 @@ func toAny(v slog.Value) any {
 
 // fieldPlan là kết quả đọc tag của một field, đã tính sẵn để không phải parse lại.
 type fieldPlan struct {
-	index   int
-	name    string
-	rule    parsedRule
-	hasRule bool
-	embed   bool
+	index     int
+	name      string
+	rule      parsedRule
+	hasRule   bool
+	embed     bool
+	omitEmpty bool
 }
 
 // planCache giữ plan theo reflect.Type, nên chi phí reflect chỉ trả lần đầu cho
@@ -315,7 +324,7 @@ func planFor(t reflect.Type) []fieldPlan {
 	plan := make([]fieldPlan, 0, t.NumField())
 	for i := range t.NumField() {
 		f := t.Field(i)
-		name, jsonSkip := jsonName(f)
+		name, jsonSkip, omitEmpty := jsonName(f)
 
 		// Field nhúng không có tên json riêng thì trải phẳng, giống encoding/json.
 		//
@@ -340,10 +349,11 @@ func planFor(t reflect.Type) []fieldPlan {
 		}
 
 		plan = append(plan, fieldPlan{
-			index:   i,
-			name:    name,
-			rule:    parseRule(Rule(rule)),
-			hasRule: hasRule,
+			index:     i,
+			name:      name,
+			rule:      parseRule(Rule(rule)),
+			hasRule:   hasRule,
+			omitEmpty: omitEmpty,
 		})
 	}
 
@@ -351,19 +361,35 @@ func planFor(t reflect.Type) []fieldPlan {
 	return plan
 }
 
-// jsonName lấy tên key theo tag json, trả về skip = true với `json:"-"`.
-func jsonName(f reflect.StructField) (name string, skip bool) {
+// jsonName đọc tag json: tên key, cờ bỏ hẳn (`json:"-"`), và cờ omitempty.
+func jsonName(f reflect.StructField) (name string, skip, omitEmpty bool) {
 	tag, ok := f.Tag.Lookup("json")
 	if !ok {
-		return f.Name, false
+		return f.Name, false, false
 	}
 	if tag == "-" {
-		return f.Name, true
+		return f.Name, true, false
 	}
-	if n, _, _ := strings.Cut(tag, ","); n != "" {
-		return n, false
+
+	n, opts, _ := strings.Cut(tag, ",")
+	omitEmpty = slices.Contains(strings.Split(opts, ","), "omitempty")
+	if n != "" {
+		return n, false, omitEmpty
 	}
-	return f.Name, false
+	return f.Name, false, omitEmpty
+}
+
+// emptyForJSON cho biết field có bị encoding/json bỏ qua vì omitempty không.
+//
+// Cần khớp với encoding/json, không chỉ dùng IsZero: một slice rỗng nhưng khác nil
+// có IsZero() = false, mà json vẫn bỏ nó.
+func emptyForJSON(rv reflect.Value) bool {
+	switch rv.Kind() {
+	case reflect.String, reflect.Slice, reflect.Map, reflect.Array:
+		return rv.Len() == 0
+	default:
+		return rv.IsZero()
+	}
 }
 
 func isStructish(t reflect.Type) bool {

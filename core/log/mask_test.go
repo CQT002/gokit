@@ -787,3 +787,91 @@ func TestMaxLineBytes_DinhDangGioiHan(t *testing.T) {
 		})
 	}
 }
+
+// Dòng log phải có cùng hình dạng với JSON thật đi ra dây. Không tôn trọng omitempty
+// thì log một response sẽ hiện cả những field mà client không bao giờ nhận, và người
+// đọc log tưởng server đã trả về chúng.
+func TestLop2_TonTrongOmitempty(t *testing.T) {
+	type envelope struct {
+		TraceID   string   `json:"trace_id,omitempty"`
+		Status    string   `json:"status"`
+		Code      string   `json:"code,omitempty"`
+		Fields    []string `json:"fields,omitempty"`
+		Data      any      `json:"data,omitempty"`
+		ElapsedMs int64    `json:"elapsed_ms,omitempty"`
+		Always    string   `json:"always"`
+	}
+
+	got := safeGroup(t, envelope{Status: "ACCEPT"})
+
+	for _, k := range []string{"trace_id", "code", "fields", "data", "elapsed_ms"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("field %q có omitempty và đang rỗng, không được xuất hiện: %#v", k, got[k])
+		}
+	}
+	// Field không có omitempty thì vẫn phải hiện, dù rỗng.
+	if _, ok := got["always"]; !ok {
+		t.Error("field không khai omitempty bị bỏ oan")
+	}
+	if got["status"] != "ACCEPT" {
+		t.Errorf("status = %#v", got["status"])
+	}
+}
+
+func TestLop2_OmitemptyVoiGiaTriKhacRong(t *testing.T) {
+	type doc struct {
+		Name  string   `json:"name,omitempty"`
+		Count int      `json:"count,omitempty"`
+		Tags  []string `json:"tags,omitempty"`
+		Flag  bool     `json:"flag,omitempty"`
+	}
+	got := safeGroup(t, doc{Name: "an", Count: 3, Tags: []string{"a"}, Flag: true})
+
+	for _, k := range []string{"name", "count", "tags", "flag"} {
+		if _, ok := got[k]; !ok {
+			t.Errorf("field %q có giá trị mà bị bỏ: %#v", k, got)
+		}
+	}
+}
+
+// Slice rỗng nhưng khác nil: IsZero() = false nhưng encoding/json vẫn bỏ nó.
+func TestLop2_OmitemptySliceRongKhacNil(t *testing.T) {
+	type doc struct {
+		Tags []string       `json:"tags,omitempty"`
+		Meta map[string]any `json:"meta,omitempty"`
+		// Cần một field luôn xuất hiện: struct mà mọi field đều bị bỏ tạo ra group
+		// rỗng, và slog loại hẳn attribute có group rỗng.
+		Kind string `json:"kind"`
+	}
+	got := safeGroup(t, doc{Tags: []string{}, Meta: map[string]any{}, Kind: "doc"})
+
+	for _, k := range []string{"tags", "meta"} {
+		if _, ok := got[k]; ok {
+			t.Errorf("field %q rỗng khác nil vẫn xuất hiện — không khớp encoding/json", k)
+		}
+	}
+}
+
+// Field nhạy cảm không có tag và không đi qua Decode vẫn phải được che: đó là đường
+// mà request bị middleware từ chối, hoặc request được idempotency phát lại, đi qua.
+func TestLop3_CheDuLieuThanhToanMacDinh(t *testing.T) {
+	payload := map[string]any{
+		"card_no":     "4111111111111111",
+		"card_number": "5555555555554444",
+		"pan":         "378282246310005",
+		"cvv":         "123",
+		"cvc":         "456",
+		"amount":      1000,
+	}
+	got := log.SafeMap(payload, log.MaskConfig{})
+
+	raw := string(mustJSON(t, got))
+	for _, leaked := range []string{"4111111111111111", "5555555555554444", "378282246310005", "123", "456"} {
+		if strings.Contains(raw, leaked) {
+			t.Errorf("giá trị %q lọt ra: %s", leaked, raw)
+		}
+	}
+	if !strings.Contains(raw, "1000") {
+		t.Error("field không nhạy cảm bị che oan")
+	}
+}
