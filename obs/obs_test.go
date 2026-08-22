@@ -25,6 +25,29 @@ func scrape(t *testing.T, reg *prometheus.Registry) string {
 	return rec.Body.String()
 }
 
+// labelValues trả về mọi giá trị label của mọi series trong registry.
+//
+// Dùng cho các khẳng định về cardinality: chỉ label mới sinh series, còn giá trị
+// số của metric thì không — nên chỉ label là chỗ đáng kiểm.
+func labelValues(t *testing.T, reg *prometheus.Registry) []string {
+	t.Helper()
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+
+	var out []string
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				out = append(out, lp.GetValue())
+			}
+		}
+	}
+	return out
+}
+
 // NewRegistry phải rỗng thật: một hàm tạo "đã có sẵn vài thứ" buộc người dùng phải
 // nhớ chính xác nó đã có gì để tránh đăng ký trùng.
 //
@@ -116,9 +139,17 @@ func TestHTTPMetrics(t *testing.T) {
 	}
 
 	// Đây là khẳng định quan trọng nhất của cả package: ID thật không được thành label.
+	//
+	// Kiểm trên giá trị label lấy từ Gather(), không phải trên text của cả lần
+	// scrape: text đó có cả giá trị số của histogram, và một con số như
+	// 2.6669999999999996e-06 chứa chuỗi "999999" — tìm chuỗi con trong đó làm
+	// test đỏ theo độ trễ đo được, tức là chập chờn.
+	values := labelValues(t, reg)
 	for _, id := range []string{"999999", "/users/1", "/users/2"} {
-		if strings.Contains(body, id) {
-			t.Errorf("path thật %q xuất hiện trong label — nổ cardinality:\n%s", id, body)
+		for _, v := range values {
+			if strings.Contains(v, id) {
+				t.Errorf("path thật %q xuất hiện trong label %q — nổ cardinality", id, v)
+			}
 		}
 	}
 	if !strings.Contains(body, `route="/orders"`) {
