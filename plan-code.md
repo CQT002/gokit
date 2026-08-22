@@ -15,7 +15,7 @@ Ký hiệu: `⬜` chưa làm · `🔄` đang làm · `✅` xong
 | 1 | `core` — log/errs/config/trace/crypto... | ✅ |
 | 2 | `obs` + `httpx` — middleware, server, client | ✅ |
 | 3 | `db` + `cache` + `testx` | ✅ |
-| 4 | `queue/kafka` | ⬜ |
+| 4 | `queue/kafka` | ✅ |
 | 5 | Hoàn thiện, godoc, tag version | ⬜ |
 
 Chi tiết từng hạng mục ở [mục 5](#5-lộ-trình-implement). Làm xong hạng mục nào thì tick checkbox ở đó và cập nhật bảng này.
@@ -111,7 +111,7 @@ gokit/
 │
 ├── queue/                     # thư mục thường, KHÔNG có go.mod ở đây
 │   └── kafka/     go.mod → .../queue/kafka
-│       └── deps: core, obs, franz-go, franz-go/plugin/kprom
+│       └── deps: core, franz-go, franz-go/plugin/kprom, x/sync, client_golang
 │
 ├── testx/         go.mod → .../testx
 │   └── deps: testcontainers-go (+ modules pg/mysql/redis/kafka), yaml.v3
@@ -127,15 +127,16 @@ core ← httpx       ← ─┐
 core ← db          ← ─┤
 core ← cache       ← ─├─ examples/api
 core ← queue/kafka ← ─┘
-obs  ← {db}                             (dự kiến thêm queue/kafka ở Phase 4)
+obs  ← {db}                             (chỉ db, xem ghi chú bên dưới)
 httpx/idempotency ← cache/idemstore     (interface ở httpx, impl ở cache)
 testx ← (chỉ dùng trong test)
 ```
 
-Sau khi làm xong Phase 3, `httpx` và `cache` **không** import `obs`. Cả hai đo lường qua
-đường của riêng chúng — `obs.HTTPMetrics` tự là một middleware nên app tự ghép vào, còn
-`cache` ghi lệnh lỗi và lệnh chậm qua slog. Chỉ `db` cần `obs` thật, để bọc
-`RegisterDBStats`. Đồ thị này là **thực tế của code**, không phải dự định.
+Sau khi làm xong Phase 4, chỉ `db` import `obs`. `httpx` đo qua middleware
+`obs.HTTPMetrics` mà app tự ghép vào; `cache` ghi lệnh lỗi và lệnh chậm qua slog; còn
+`queue/kafka` nhận thẳng một `*prometheus.Registry` vì phần lớn metric của nó do plugin
+`kprom` của franz-go sinh, và `obs` không có gì thêm để đóng góp. Đồ thị này là **thực tế
+của code**, không phải dự định.
 
 ---
 
@@ -1032,8 +1033,15 @@ type ProducerConfig struct {
 func NewProducer(cfg ProducerConfig) (*Producer, error)
 func (p *Producer) Send(ctx context.Context, msgs ...Message) error
 func (p *Producer) SendJSON(ctx context.Context, topic, key string, v any) error
+func (p *Producer) Flush(ctx context.Context) error   // bắt buộc gọi trước khi dừng nếu Async
+func (p *Producer) Ping(ctx context.Context) error
+func (p *Producer) Client() *kgo.Client               // cửa thoát: transaction, kadm...
 func (p *Producer) Close()
 ```
+
+`ProducerConfig` có thêm `ClientOpts []kgo.Opt` — cửa thoát cho những tuỳ chọn franz-go mà
+config này không bọc. Bọc lại từng cái trong số hàng trăm tuỳ chọn của franz-go sẽ biến
+config thành một bản sao kém hơn của nó.
 
 #### Consumer — dùng handler, không dùng channel
 
@@ -1057,8 +1065,14 @@ type ConsumerConfig struct {
 
 func NewConsumer(cfg ConsumerConfig) (*Consumer, error)
 func (c *Consumer) Run(ctx context.Context, h Handler) error   // chỉ commit khi h trả nil
+func (c *Consumer) Ping(ctx context.Context) error
+func (c *Consumer) Client() *kgo.Client
 func (c *Consumer) Close()
 ```
+
+`ConsumerConfig` có thêm `ClientID`, `MaxPollRecords` và `ClientOpts`. `MaxPollRecords`
+(mặc định 500) là số message lấy về mỗi vòng, và cũng là trần cho thời gian một lần
+rebalance bị chặn — consumer xử lý xong cả lô rồi mới cho phép rebalance.
 
 Ba điểm khác biệt so với bản tham chiếu:
 
@@ -1552,14 +1566,85 @@ chứa đúng chuỗi đó — nên test đỏ tuỳ theo độ trễ đo đư�
 Đã đổi sang kiểm trên giá trị label lấy từ `reg.Gather()`: chỉ label mới sinh series, nên
 chỉ label là chỗ đáng kiểm. Khẳng định giữ nguyên, chỉ hết chập chờn.
 
-### Phase 4 — `queue/kafka` `⬜`
+### Phase 4 — `queue/kafka` `✅`
 
-- [ ] `Producer` (sync + async), SASL/TLS
-- [ ] Propagate trace qua Kafka header
-- [ ] `Consumer` với handler + concurrency
-- [ ] Retry + DLQ
-- [ ] Metrics qua `kprom`
-- [ ] Test bằng `kfake` của franz-go + 1 test integration thật
+- [x] `Producer` (sync + async), SASL/TLS
+- [x] Propagate trace qua Kafka header
+- [x] `Consumer` với handler + concurrency
+- [x] Retry + DLQ
+- [x] Metrics qua `kprom`
+- [x] Test bằng `kfake` của franz-go + 1 test integration thật
+
+**Ghi chú khi làm phần `queue/kafka`** — những chỗ lệch so với đặc tả ở
+[mục 4.16](#416-queuekafka), và lý do:
+
+- **Một deadlock thật ở lúc shutdown, do chính test bắt được.** Consumer bật
+  `BlockRebalanceOnPoll` để rebalance không xảy ra giữa lúc đang xử lý một lô — không có nó
+  thì partition bị thu hồi giữa chừng và lần commit sau ghi offset cho partition mà instance
+  này không còn sở hữu. Cái bẫy đi kèm: **mọi** đường ra khỏi một lần poll đều phải gọi
+  `AllowRebalance`. Bản đầu thoát sớm khi `ctx` bị cancel mà không gọi, và `Close` treo vĩnh
+  viễn — vì rời group cũng là một lần rebalance, và nó đang bị chặn bởi đúng lần poll vừa
+  thoát ra. Triệu chứng chỉ hiện ra lúc shutdown, tức là chỗ ít ai test nhất.
+- **Xử lý song song theo partition, tuần tự trong partition.** `Concurrency` không phải số
+  worker bốc message từ chung một hàng đợi — cách đó phá đúng đảm bảo thứ tự duy nhất mà
+  Kafka cho. Có test với 4 partition, 4 goroutine, 100 message, kiểm offset trong từng
+  partition luôn tăng.
+- **Không khai `DLQTopic` thì message hết lượt thử lại làm `Run` trả lỗi.** Ba lựa chọn
+  đều có giá: bỏ qua trong im lặng là mất dữ liệu, thử lại mãi là chặn cả partition mà không
+  ai biết, dừng service là ồn ào nhưng nhìn thấy được. Chọn cái ồn ào. Muốn "bỏ qua" thì để
+  handler trả `nil` — ở đó mới có đủ ngữ cảnh để quyết định, và hợp đồng của [Handler] nói
+  rõ điều đó.
+- **Đẩy vào DLQ là thao tác đồng bộ, và phải xong trước khi commit.** Commit trước khi DLQ
+  nhận được là mất hẳn message. Đẩy DLQ thất bại thì `Run` trả lỗi và cả lô được gửi lại.
+- **Panic trong handler được `recover` và biến thành error.** Không bắt thì cả process chết,
+  và mọi partition khác mà instance này đang giữ ngừng theo.
+- **`franz-go` bật ghi idempotent mặc định, và cơ chế đó đòi `acks=all`.** Hạ `RequiredAcks`
+  mà quên `DisableIdempotentWrite` thì client trả một lỗi cấu hình rất khó hiểu. Package tự
+  xử lý; có test cho cả ba mức acks.
+- **SASL/PLAIN không có TLS bị chặn ngay ở `NewProducer`/`NewConsumer`.** Cơ chế đó gửi mật
+  khẩu **nguyên văn** trên dây, và đây là cấu hình rất dễ vô tình để lọt ra production.
+  SCRAM không TLS thì cho qua — nó không gửi mật khẩu nguyên văn.
+- **`MaxRetries` và `RetryBackoff.MaxAttempts` là hai field cùng nói về một thứ**, nên quy
+  tắc gộp được viết ra một chỗ: `> 0` thì thắng (`MaxAttempts = MaxRetries + 1`), `< 0` là
+  không thử lại, `= 0` thì giữ nguyên `RetryBackoff`.
+- **Producer chế độ `Async` chỉ báo lỗi qua log và metric.** `Send` trả `nil` ngay cả khi
+  việc gửi sau đó thất bại, nên callback ghi log là thứ duy nhất giữ message khỏi biến mất
+  trong im lặng. Có test bắt đúng dòng log đó.
+- **Thêm `Producer.Flush`.** Ở chế độ async, không flush trước khi dừng là mất message còn
+  trong bộ đệm. `Close` cũng flush; `Flush` riêng dành cho điểm chốt giữa chừng.
+- **Metric chia hai tầng.** `kprom` đo phần ở tầng client (byte qua dây, số lần kết nối lại,
+  độ trễ request tới broker) — nhóm trả lời "vấn đề ở mạng hay ở code". Package tự đăng ký
+  thêm nhóm về **kết quả xử lý**: `kafka_consumer_messages_total{topic,group,result}` với
+  result = ok|dlq|error, `kafka_consumer_retries_total`, và histogram thời gian handler.
+  DLQ tăng nghĩa là có dữ liệu đang không được xử lý — kprom không biết điều đó.
+  Namespace của kprom tách theo vai trò (`kafka_producer_`, `kafka_consumer_`) để producer
+  và consumer trong cùng một process đăng ký được vào cùng một registry.
+- **`traceparent` không bị ghi đè nếu chỗ gọi đã đặt sẵn**, và `Send` không sửa map
+  `Headers` của chỗ gọi. Cái thứ nhất là để phát lại message từ DLQ mà vẫn giữ trace gốc;
+  cái thứ hai là để gửi cùng một `Message` hai lần không sinh tác dụng phụ.
+- **Consumer luôn tạo span *con*, không dùng lại span của producer.** Việc xử lý ở consumer
+  là một chặng riêng trong cùng một trace, nên nó cần span ID của mình.
+- **`Message.Headers` là map, trong khi Kafka cho phép trùng key.** Đánh đổi có ý thức:
+  header trùng key hầu như không được dùng, còn map thì đọc và ghi dễ hơn hẳn một slice cặp
+  key/value. Trùng key thì giá trị cuối thắng.
+- **`Consumer.Run` chỉ chạy được một lần cùng lúc.** Hai vòng lặp cùng poll một client sẽ
+  chia nhau message theo cách không ai kiểm soát được, và commit của bên này ghi đè tiến độ
+  của bên kia.
+
+Test đơn vị **không cần Docker**: chúng chạy trên `kfake` — bản cài đặt protocol Kafka thuần
+Go của chính franz-go, có partition thật, consumer group thật, commit offset thật. Nhờ vậy
+những thứ chỉ lộ ra khi nói chuyện với broker (rebalance, commit, thứ tự trong partition)
+đều được kiểm bằng đường thật. Một test integration duy nhất chạy trên Kafka thật trong
+Docker (`testx.KafkaContainer`, build tag `integration`) làm chốt cuối cho phần `kfake`
+không mô phỏng được: phiên bản broker thật và cấu hình phía server.
+
+**Một lỗi trong `testx` do chính test integration này bắt được.** Helper container gọi
+`registerTerminate` trước khi kiểm lỗi của `Run` — đúng, vì `Run` có thể trả về **cả**
+container lẫn lỗi. Nhưng khi `Run` thất bại hẳn thì nó trả về một `*Container` **nil**, và
+một con trỏ nil nhét vào interface thì interface đó khác nil: cái bẫy kinh điển của Go. Phép
+so sánh `c == nil` cho qua, rồi `Terminate` panic ở bước dọn dẹp và **che mất lỗi thật** —
+màn hình chỉ còn một stack trace nil pointer thay vì dòng "Docker chưa chạy". Đã đổi sang
+kiểm bằng reflect, có test riêng cho cả hai trường hợp.
 
 ### Phase 5 — Hoàn thiện `⬜`
 

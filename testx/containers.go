@@ -10,6 +10,7 @@ package testx
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -143,6 +144,25 @@ func KafkaContainer(tb testing.TB) []string {
 	return brokers
 }
 
+// terminator là phần duy nhất của container mà registerTerminate cần.
+type terminator interface {
+	Terminate(context.Context, ...testcontainers.TerminateOption) error
+}
+
+// isNil cho biết một giá trị interface có đang bọc con trỏ nil không.
+//
+// Cần kiểm bằng reflect chứ không phải `c == nil`: khi Run thất bại, nó trả về
+// một *Container nil, và một con trỏ nil nhét vào interface thì **interface đó
+// khác nil** — cái bẫy kinh điển của Go. So sánh thường sẽ cho qua, rồi lời gọi
+// Terminate ngay sau đó panic và che mất lỗi thật (thường là "Docker chưa chạy").
+func isNil(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
+}
+
 // registerTerminate đăng ký việc xoá container khi test xong.
 //
 // Gọi **trước** khi kiểm lỗi của Run: Run có thể trả về cả container lẫn lỗi khi
@@ -150,10 +170,8 @@ func KafkaContainer(tb testing.TB) []string {
 // sẽ để lại container mồ côi chạy mãi trên máy dev.
 //
 // Dùng context riêng để xoá: ctx của lúc dựng đã hết hạn từ lâu.
-func registerTerminate(tb testing.TB, c interface {
-	Terminate(context.Context, ...testcontainers.TerminateOption) error
-}) {
-	if c == nil {
+func registerTerminate(tb testing.TB, c terminator) {
+	if isNil(c) {
 		return
 	}
 	tb.Cleanup(func() {
