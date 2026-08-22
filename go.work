@@ -1,0 +1,12 @@
+go 1.25.0
+
+use (
+	./cache
+	./core
+	./db
+	./examples
+	./httpx
+	./obs
+	./queue/kafka
+	./testx
+)

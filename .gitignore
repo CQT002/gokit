@@ -1,0 +1,15 @@
+# go.work is committed (dev convenience); the checksum file is not — it is
+# machine-local and would fight between contributors.
+go.work.sum
+
+# Build & test output
+/bin/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 18:00 UTC = 01:00 giờ VN — chạy full, gồm cả test integration
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_VERSION: v2.13.0
+  # Phiên bản tối thiểu mà mọi go.mod khai báo. Test cả bản này và bản stable.
+  GO_MIN: "1.25.x"
+
+jobs:
+  guard:
+    name: guard (module path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Chạy trước mọi job khác: lẫn hoa/thường trong module path làm build graph
+      # có 2 module trùng nhau, lỗi hiện ra rất khó hiểu.
+      - run: make check-module-path
+
+  test:
+    name: test ${{ matrix.module }} (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [core, obs, httpx, db, cache, queue/kafka, testx, examples]
+        go: ["1.25.x", "stable"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+      - name: go vet
+        working-directory: ${{ matrix.module }}
+        run: go vet ./...
+      - name: go test -race
+        working-directory: ${{ matrix.module }}
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - name: coverage
+        working-directory: ${{ matrix.module }}
+        run: go tool cover -func=coverage.out | tail -1
+
+  lint:
+    name: lint ${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [core, obs, httpx, db, cache, queue/kafka, testx, examples]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: ${{ env.GOLANGCI_VERSION }}
+          working-directory: ${{ matrix.module }}
+          args: --config=${{ github.workspace }}/.golangci.yml
+
+  nowork:
+    # go.work che lỗi version giữa các module: local pass, người dùng thật build vỡ.
+    # Job này build đúng như người ngoài build — chỉ dựa vào require trong go.mod.
+    name: build GOWORK=off
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_MIN }}
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+      - run: make build-nowork
+      - name: test GOWORK=off
+        env:
+          GOWORK: "off"
+        run: make test
+
+  tidy:
+    name: go mod tidy đã chạy chưa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+      - run: make tidy-check
+
+  integration:
+    # Cần Docker (testcontainers) → chỉ chạy nightly / dispatch tay, không chạy mỗi PR.
+    name: test integration
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache-dependency-path: |
+            **/go.sum
+            **/go.mod
+      - run: make test-integration

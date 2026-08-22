@@ -1,0 +1,63 @@
+# golangci-lint v2 — pin phiên bản ở Makefile/CI (GOLANGCI_VERSION) để local và CI khớp nhau.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - revive
+    - unconvert
+    - usestdlibvars
+
+  settings:
+    errcheck:
+      # Đóng resource trong defer là idiom Go; ép check ở đây chỉ tạo noise.
+      exclude-functions:
+        - (io.Closer).Close
+    govet:
+      enable:
+        - shadow
+    revive:
+      rules:
+        # Mọi symbol export phải có godoc — yêu cầu "định nghĩa xong" của plan.
+        #
+        # Không bật checkPrivateReceivers: nó đòi godoc cho method của type
+        # unexported, mà những method đó không xuất hiện trong godoc nên comment
+        # chỉ phục vụ linter. Chuẩn đã chốt là "godoc cho mọi symbol export".
+        - name: exported
+          arguments: [disableStutteringCheck]
+        - name: package-comments
+        - name: context-as-argument
+        - name: error-strings
+        - name: error-return
+        - name: indent-error-flow
+        - name: unexported-return
+    gosec:
+      excludes:
+        # G404 (math/rand) không loại trừ: core/idx bắt buộc dùng crypto/rand.
+        - G115 # int conversion overflow — quá nhiều false positive ở chỗ đo lường
+
+  exclusions:
+    rules:
+      # Test được nới: bảng test dùng nhiều literal, và panic/assert là bình thường.
+      - path: _test\.go$
+        linters:
+          - gosec
+          - errcheck
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/cqt002/gokit

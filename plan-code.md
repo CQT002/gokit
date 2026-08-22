@@ -11,11 +11,11 @@ Ký hiệu: `⬜` chưa làm · `🔄` đang làm · `✅` xong
 
 | Phase | Nội dung | Trạng thái |
 |---|---|---|
-| 0 | Bộ khung repo, go.mod, go.work, CI | ⬜ |
-| 1 | `core` — log/errs/config/trace/crypto... | ⬜ |
-| 2 | `obs` + `httpx` — middleware, server, client | ⬜ |
-| 3 | `db` + `cache` + `testx` | ⬜ |
-| 4 | `kafka` | ⬜ |
+| 0 | Bộ khung repo, go.mod, go.work, CI | ✅ |
+| 1 | `core` — log/errs/config/trace/crypto... | ✅ |
+| 2 | `obs` + `httpx` — middleware, server, client | ✅ |
+| 3 | `db` + `cache` + `testx` | ✅ |
+| 4 | `queue/kafka` | ✅ |
 | 5 | Hoàn thiện, godoc, tag version | ⬜ |
 
 Chi tiết từng hạng mục ở [mục 5](#5-lộ-trình-implement). Làm xong hạng mục nào thì tick checkbox ở đó và cập nhật bảng này.
@@ -45,6 +45,10 @@ Nguyên tắc thiết kế:
 | Cấu trúc | Multi-module (8 module trong 1 repo) | Cách ly dependency nặng |
 | HTTP | `net/http` thuần, **không phụ thuộc router** | Middleware `func(http.Handler) http.Handler` dùng được ở mọi router; Echo tiêu thụ được stdlib chứ không ngược lại |
 | Kafka | `twmb/franz-go` | Pure Go, bảo trì tích cực, tự xử lý reconnect/metadata, có `kprom` cho metrics sẵn |
+| Vị trí module Kafka | `queue/kafka`, **không** phải `kafka` | Module path là API công khai: sau khi tag `kafka/v0.1.0` thì đổi path là breaking change cho mọi importer, còn path cũ vẫn nằm mãi trong proxy. Driver thứ hai (RabbitMQ/SQS/NATS) mang cây dependency riêng và API khác hẳn, không thể nằm chung module với Kafka |
+| `queue/` là gì | **Thư mục thường**, không phải module | Nếu `queue` là module rồi `queue/kafka` là subpackage thì franz-go lây sang mọi người import `queue` — phá đúng lý do chọn multi-module |
+| Interface chung cho queue | **Không làm** (xem mục 7) | Kafka có partition/offset/consumer group/commit tay; RabbitMQ có exchange/ack/prefetch; SQS có visibility timeout. Mẫu số chung `Publish(topic, msg)` bỏ mất đúng những thứ khiến người ta chọn Kafka |
+| `db` và `cache` giữ phẳng | Không đổi thành `db/gorm`, `cache/redis` | GORM **đã là** lớp abstract driver (postgres/mysql trong cùng module). Còn `cache/lock`, `cache/leader`, `cache/cron` bản chất là redis-specific (redislock, `SET NX`) — thêm một tầng thư mục không mở ra khả năng nào thật |
 | Config | `yaml.v3` + `sethvargo/go-envconfig` | 2 deps thay vì 13 của viper; không global state; env override grep được |
 | Observability | Prometheus metrics + trace ID chuẩn W3C (chưa cài OTel SDK) | Metrics rẻ và giá trị cao; format trace ID là thứ gần như không đổi được về sau |
 | Masking log | **3 lớp**: chặn theo kích thước → tag `log:` trên struct → danh sách tên field (fallback) | Luật theo kích thước an toàn mặc định; tag đi cùng field nên không lệch pha |
@@ -103,13 +107,14 @@ gokit/
 │   ├── leader/                # leader election
 │   ├── cron/                  # distributed cron (leader + scheduler)
 │   ├── idemstore/             # store Redis cho httpx/idempotency
-│   └── deps: core, obs, go-redis/v9, redislock
+│   └── deps: core, httpx, go-redis/v9, redislock, robfig/cron/v3, x/sync
 │
-├── kafka/         go.mod → .../kafka
-│   └── deps: core, obs, franz-go, franz-go/plugin/kprom
+├── queue/                     # thư mục thường, KHÔNG có go.mod ở đây
+│   └── kafka/     go.mod → .../queue/kafka
+│       └── deps: core, franz-go, franz-go/plugin/kprom, x/sync, client_golang
 │
 ├── testx/         go.mod → .../testx
-│   └── deps: testcontainers-go, testify
+│   └── deps: testcontainers-go (+ modules pg/mysql/redis/kafka), yaml.v3
 │
 └── examples/
     └── api/                   # service mẫu — nơi kiểm chứng thiết kế
@@ -118,14 +123,20 @@ gokit/
 **Đồ thị phụ thuộc** (một chiều, không có cycle):
 
 ```
-core ← httpx ← ─┐
-core ← db   ← ─ ┤
-core ← cache ←  ├─ examples/api
-core ← kafka ←  ┘
-obs  ← {httpx, db, cache, kafka}
+core ← httpx       ← ─┐
+core ← db          ← ─┤
+core ← cache       ← ─├─ examples/api
+core ← queue/kafka ← ─┘
+obs  ← {db}                             (chỉ db, xem ghi chú bên dưới)
 httpx/idempotency ← cache/idemstore     (interface ở httpx, impl ở cache)
 testx ← (chỉ dùng trong test)
 ```
+
+Sau khi làm xong Phase 4, chỉ `db` import `obs`. `httpx` đo qua middleware
+`obs.HTTPMetrics` mà app tự ghép vào; `cache` ghi lệnh lỗi và lệnh chậm qua slog; còn
+`queue/kafka` nhận thẳng một `*prometheus.Registry` vì phần lớn metric của nó do plugin
+`kprom` của franz-go sinh, và `obs` không có gì thêm để đóng góp. Đồ thị này là **thực tế
+của code**, không phải dự định.
 
 ---
 
@@ -765,6 +776,10 @@ type Config struct {
 
 func Open(ctx context.Context, cfg Config) (*gorm.DB, error)    // trả *gorm.DB trực tiếp
 func NewGormLogger(l *slog.Logger, slow time.Duration) logger.Interface
+
+func Close(gdb *gorm.DB) error                                  // GORM không có Close
+func Stats(gdb *gorm.DB) (func() sql.DBStats, error)
+func RegisterMetrics(reg *prometheus.Registry, name string, gdb *gorm.DB) error
 ```
 
 **Quyết định:** không bọc `*gorm.DB` trong interface giả. Bản tham chiếu có interface `SqlGormDatabase` nhưng vẫn trả `*gorm.DB` — abstraction không abstract được gì. GORM chính là abstraction rồi.
@@ -836,8 +851,13 @@ type Migration struct {
     Down func(*gorm.DB) error
 }
 func Run(ctx context.Context, db *gorm.DB, ms []Migration, opts Options) error
-func Rollback(ctx context.Context, db *gorm.DB, ms []Migration, to string) error
+func Rollback(ctx context.Context, db *gorm.DB, ms []Migration, to string, opts Options) error
+func Applied(ctx context.Context, db *gorm.DB, opts Options) ([]Record, error)
 ```
+
+`Rollback` nhận `opts` (khác bản nháp ở trên): không có nó thì `Run` với `Options.Table`
+tuỳ chọn sẽ khiến `Rollback` đọc sai bảng lịch sử. `to` là mốc **muốn giữ**, không bị hoàn
+tác — giống cách `git reset` nhận commit muốn giữ.
 
 ---
 
@@ -856,9 +876,18 @@ type Config struct {
 
 type Client struct{}
 func New(cfg Config) (*Client, error)
+func NewWithRedis(rdb redis.UniversalClient, log *slog.Logger) (*Client, error)
+
 func (c *Client) Redis() redis.UniversalClient
+func (c *Client) Logger() *slog.Logger
+func (c *Client) Flight() *Flight              // nhóm chống stampede, xem GetOrLoad
+func (c *Client) Ping(ctx context.Context) error
 func (c *Client) Close() error
 ```
+
+`New` **không** kết nối (go-redis mở connection lười). Gọi `Ping` lúc khởi động để
+sai địa chỉ hay sai mật khẩu lộ ra ngay thay vì ở request đầu tiên — vai trò giống
+lần ping trong `db.Open`.
 
 **`redis.UniversalClient` xử lý cả standalone và cluster bằng một type** → bỏ hẳn việc phải viết 2 file gần trùng nhau như bản tham chiếu (redis.go + redis-cluster.go, mỗi file ~300–450 dòng).
 
@@ -891,13 +920,20 @@ Cache miss trả `errs.Code("cache_miss")` — consumer không phải import `go
 #### Cache-aside + chống stampede
 
 ```go
+type Loader interface { KV; Flight() *Flight }   // *Client cài đặt
+
 func GetOrLoad[T any](
-    ctx context.Context, c KV, key string, ttl time.Duration,
+    ctx context.Context, c Loader, key string, ttl time.Duration,
     load func(context.Context) (T, error),
 ) (T, error)
 ```
 
 Dùng `golang.org/x/sync/singleflight`: 100 request cùng miss một key thì chỉ 1 request xuống DB.
+
+Nhận `Loader` chứ không phải `KV` vì nhóm singleflight phải **thuộc về client**, không
+phải biến toàn cục của package: hai `Client` trỏ tới hai Redis khác nhau mà dùng chung
+một nhóm thì một tên key trùng nhau ở hai hệ thống sẽ bị gộp thành một lần load. Mock
+vẫn dễ — thêm một field `cache.Flight` vào struct mock là xong.
 
 #### Lock
 
@@ -923,10 +959,13 @@ type ElectorConfig struct {
     Logger        *slog.Logger
 }
 
-func NewElector(cfg ElectorConfig) *Elector
+func NewElector(cfg ElectorConfig) (*Elector, error)
 func (e *Elector) Run(ctx context.Context, onLead func(context.Context) error) error
 func (e *Elector) IsLeader() bool
 ```
+
+`NewElector` trả lỗi (khác bản nháp ở trên): thiếu `Key` hoặc `Redis` là lỗi cấu hình
+và phải lộ ra lúc khởi động, nhất quán với `httpx.NewServer` và `db.Open`.
 
 Gọn hơn bản tham chiếu (4 callback: elected / notElected / demoted / error) → một hàm `onLead(ctx)`, ctx bị cancel khi mất quyền leader. Khó dùng sai.
 
@@ -934,8 +973,9 @@ Gọn hơn bản tham chiếu (4 callback: elected / notElected / demoted / erro
 
 ```go
 type Cron struct{}
-func NewCron(e *Elector, l *slog.Logger) *Cron
+func New(e *leader.Elector, l *slog.Logger) *Cron   // gọi là cron.New, không phải cron.NewCron
 func (c *Cron) Add(name, spec string, job func(context.Context) error) error
+func (c *Cron) Jobs() []string
 func (c *Cron) Run(ctx context.Context) error   // chỉ chạy trên instance đang là leader
 ```
 
@@ -947,7 +987,16 @@ Implementation Redis cho `httpx/idempotency.Store`. Dùng `SET NX` để reserve
 
 ---
 
-### 4.16 `kafka`
+### 4.16 `queue/kafka`
+
+Đường dẫn module là `github.com/cqt002/gokit/queue/kafka`. Không có package nào ở
+`queue/` — chỗ đó chỉ là namespace để driver thứ hai sau này (`queue/rabbitmq`,
+`queue/sqs`) có nhà, mà không kéo theo dependency của Kafka.
+
+Phần dùng chung giữa các driver **đã được factor sẵn** ở `core/tracectx`: propagate
+trace qua header là cùng một cơ chế cho HTTP và cho mọi broker. Nếu về sau phát hiện
+thêm phần chung thật thì tạo `queue/queue` — thêm package mới không breaking, còn đổi
+đường dẫn module thì breaking.
 
 ```go
 type SASLMechanism string
@@ -984,8 +1033,15 @@ type ProducerConfig struct {
 func NewProducer(cfg ProducerConfig) (*Producer, error)
 func (p *Producer) Send(ctx context.Context, msgs ...Message) error
 func (p *Producer) SendJSON(ctx context.Context, topic, key string, v any) error
+func (p *Producer) Flush(ctx context.Context) error   // bắt buộc gọi trước khi dừng nếu Async
+func (p *Producer) Ping(ctx context.Context) error
+func (p *Producer) Client() *kgo.Client               // cửa thoát: transaction, kadm...
 func (p *Producer) Close()
 ```
+
+`ProducerConfig` có thêm `ClientOpts []kgo.Opt` — cửa thoát cho những tuỳ chọn franz-go mà
+config này không bọc. Bọc lại từng cái trong số hàng trăm tuỳ chọn của franz-go sẽ biến
+config thành một bản sao kém hơn của nó.
 
 #### Consumer — dùng handler, không dùng channel
 
@@ -1009,8 +1065,14 @@ type ConsumerConfig struct {
 
 func NewConsumer(cfg ConsumerConfig) (*Consumer, error)
 func (c *Consumer) Run(ctx context.Context, h Handler) error   // chỉ commit khi h trả nil
+func (c *Consumer) Ping(ctx context.Context) error
+func (c *Consumer) Client() *kgo.Client
 func (c *Consumer) Close()
 ```
+
+`ConsumerConfig` có thêm `ClientID`, `MaxPollRecords` và `ClientOpts`. `MaxPollRecords`
+(mặc định 500) là số message lấy về mỗi vòng, và cũng là trần cho thời gian một lần
+rebalance bị chặn — consumer xử lý xong cả lô rồi mới cho phép rebalance.
 
 Ba điểm khác biệt so với bản tham chiếu:
 
@@ -1026,21 +1088,35 @@ Trace: producer chèn `traceparent` vào header, consumer đọc ra và đặt v
 
 ```go
 // Container (build tag `integration`)
-func PostgresContainer(t *testing.T) (dsn string)
-func MySQLContainer(t *testing.T) (dsn string)
-func RedisContainer(t *testing.T) (addr string)
-func KafkaContainer(t *testing.T) (brokers []string)
+func PostgresContainer(tb testing.TB) (dsn string)
+func MySQLContainer(tb testing.TB) (dsn string)
+func RedisContainer(tb testing.TB) (addr string)
+func KafkaContainer(tb testing.TB) (brokers []string)
 
 // Log assertion
-func CaptureLogs(t *testing.T) (*slog.Logger, *LogBuffer)
+func CaptureLogs(tb testing.TB) (*slog.Logger, *LogBuffer)
 func (b *LogBuffer) Has(level slog.Level, msg string) bool
-func (b *LogBuffer) Field(idx int, key string) any
+func (b *LogBuffer) Find(level slog.Level, msg string) (map[string]any, bool)
+func (b *LogBuffer) Count(level slog.Level, msg string) int
+func (b *LogBuffer) Field(idx int, key string) any   // "http.method" đi vào group
+func (b *LogBuffer) Lines() []map[string]any
+func (b *LogBuffer) Len() int
+func (b *LogBuffer) Reset()
+func (b *LogBuffer) String() string                  // nhét vào t.Errorf
 
 // Khác
-func FreezeTime(t *testing.T, at time.Time)
-func Golden(t *testing.T, name string, got []byte)
-func LoadFixture[T any](t *testing.T, path string) T
+func FreezeTime(tb testing.TB, at time.Time) *Clock  // trả đồng hồ, xem ghi chú
+func (c *Clock) Now() time.Time
+func (c *Clock) Advance(d time.Duration)
+func (c *Clock) Set(at time.Time)
+
+func Golden(tb testing.TB, name string, got []byte)  // UPDATE_GOLDEN=1 để ghi lại
+func GoldenClean(tb testing.TB, used ...string)
+func LoadFixture[T any](tb testing.TB, path string) T
 ```
+
+Nhận `testing.TB` chứ không phải `*testing.T`, nên dùng được cả trong benchmark và
+trong helper của chính test.
 
 Module này là thứ khiến bộ lib **thực sự được dùng**: nếu người ta không test nổi service viết trên gokit thì họ sẽ không dùng gokit.
 
@@ -1048,88 +1124,533 @@ Module này là thứ khiến bộ lib **thực sự được dùng**: nếu ng�
 
 ## 5. Lộ trình implement
 
-### Phase 0 — Bộ khung `⬜`
+### Phase 0 — Bộ khung `✅`
 
 - [x] Đổi tên folder local `go-libs` → `gokit`, cập nhật remote URL
-- [ ] Đổi tên repo GitHub `go-libs` → `gokit` (Settings → Repository name)
-- [ ] 8 file `go.mod` + `go.work` (không commit `go.work.sum`)
-- [ ] `.golangci.yml`, `Makefile` (`make test`, `make lint`, `make test-integration`)
-- [ ] CI: matrix theo module; **1 job riêng chạy `GOWORK=off`**
-- [ ] CI: bước grep chặn module path viết hoa `CQT002`
-- [ ] `README.md`
+- [x] Đổi tên repo GitHub `go-libs` → `gokit` (Settings → Repository name)
+- [x] 8 file `go.mod` + `go.work` (`go.work.sum` đã vào `.gitignore`)
+- [x] `.golangci.yml`, `Makefile` (`make test`, `make lint`, `make test-integration`)
+- [x] CI: matrix theo module; **1 job riêng chạy `GOWORK=off`**
+- [x] CI: bước grep chặn module path viết hoa `CQT002` (`scripts/check-module-path.sh`)
+- [x] `README.md`
 
-### Phase 1 — `core` `⬜`
+**Việc phát sinh — di chuyển `kafka/` → `queue/kafka/`** (xem lý do ở mục 2). Làm
+trước khi có tag đầu tiên: sau khi tag rồi thì đây là breaking change cho mọi importer.
+
+- [x] `git mv kafka queue/kafka`; module path → `github.com/cqt002/gokit/queue/kafka`
+- [x] `go.work`: `use ./queue/kafka`
+- [x] `Makefile`: `MODULES` đổi `kafka` → `queue/kafka`
+- [x] `Makefile`: **`--config=../.golangci.yml` → `$(CURDIR)/.golangci.yml`** ở target
+      `lint` và `fmt`. Với module lồng một tầng, `../` trỏ vào `queue/` chứ không phải
+      gốc repo, lint sẽ fail vì không thấy config. CI không bị vì đã dùng
+      `${{ github.workspace }}`
+- [x] CI `ci.yml`: matrix `module` đổi `kafka` → `queue/kafka` ở cả job `test` và `lint`
+- [x] `README.md`: bảng module + giải thích tầng `queue/`
+- [x] Kiểm chứng: `make check` + `make build-nowork` + `make tidy-check` đều xanh
+
+Chốt trong lúc làm:
+
+| Hạng mục | Giá trị | Ghi chú |
+|---|---|---|
+| Go tối thiểu | `go 1.25.0` ở cả 8 `go.mod` | CI test matrix `1.25.x` × `stable` |
+| golangci-lint | `v2.13.0`, pin ở `Makefile` + CI | v2.6.x không đọc được export data của Go 1.27 |
+| CI | GitHub Actions — job `guard`, `test`, `lint`, `nowork`, `tidy`, `integration` | `integration` chỉ chạy nightly/dispatch |
+| Build khi `GOWORK=off` | `go build -o /dev/null ./...` | `-o dir/` đòi main package; `./...` trần thì đụng thư mục `examples/api` |
+| revive `exported` | Bỏ `checkPrivateReceivers` | Nó đòi godoc cho method của type unexported — những method không có mặt trong godoc, nên comment chỉ phục vụ linter. Chuẩn đã chốt là "godoc cho mọi symbol export" |
+| `make tidy-check` | Restore bằng `trap ... EXIT` | Bản đầu `exit 1` trước bước restore, nên khi fail nó để lại `go.mod` đã bị sửa và file `.bak` trên đĩa. Đã kiểm chứng hai chiều: pass khi tidy, fail mà không để lại dấu vết khi không tidy |
+
+> Còn một việc bằng tay: remote URL của `origin` vẫn đang viết hoa tên user. Chạy
+> `git remote set-url origin https://github.com/cqt002/gokit.git` cho khớp module path.
+> (Guard `check-module-path` quét cả `*.md`, nên đừng viết dạng viết hoa vào file này.)
+
+### Phase 1 — `core` `✅`
 
 Thứ tự bắt buộc (do phụ thuộc):
 
-- [ ] `idx`
-- [ ] `secret`
-- [ ] `tracectx` (phụ thuộc `idx`)
-- [ ] `ctxmeta`
-- [ ] `errs`
-- [ ] `log` — handler chain + **masking lớp 1** (elide theo kích thước)
-- [ ] `log` — **masking lớp 2** (`Safe` đọc tag `log:`, cache theo `reflect.Type`)
-- [ ] `log` — **masking lớp 3** (`SafeMap` theo tên field) + trần `MaxLineBytes`
-- [ ] `config` (phụ thuộc `secret`)
-- [ ] `crypto` — AES-GCM + key rotation, HMAC, argon2id
-- [ ] `retry`
-- [ ] `tlsx`
-- [ ] `timex`
+- [x] `idx`
+- [x] `secret`
+- [x] `tracectx` (phụ thuộc `idx`)
+- [x] `ctxmeta`
+- [x] `errs`
+- [x] `log` — handler chain + **masking lớp 1** (elide theo kích thước)
+- [x] `log` — **masking lớp 2** (`Safe` đọc tag `log:`, cache theo `reflect.Type`)
+- [x] `log` — **masking lớp 3** (`SafeMap` theo tên field) + trần `MaxLineBytes`
+- [x] `config` (phụ thuộc `secret`)
+- [x] `crypto` — AES-GCM + key rotation, HMAC, argon2id
+- [x] `retry`
+- [x] `tlsx`
+- [x] `timex`
 
 **Định nghĩa "xong":** coverage ≥ 80%, không cần Docker, godoc đầy đủ cho mọi symbol export.
 
+Đã thêm ngoài đặc tả ở mục 4 (đều là bổ sung, không phá vỡ API đã chốt) — cần soi
+lại khi đóng băng API cuối Phase 1:
+
+| Package | Thêm | Lý do |
+|---|---|---|
+| `secret` | `MarshalYAML`, `IsZero`, `Equal` | Dump config ra YAML là đường lộ ngang hàng với JSON. `Equal` dùng `subtle.ConstantTimeCompare` — `httpx/auth` so khớp API key cần đúng thứ này, để mỗi service tự viết `==` là hở kênh phụ |
+| `tracectx` | `Valid`, `String`, `TraceIDFrom`, `HeaderTraceparent`, `ErrInvalidTraceparent` | `Valid` là điều kiện dùng chung của `Traceparent`/`NewChild`; `HeaderTraceparent` để `httpx` và `queue/kafka` không tự viết lại tên header |
+| `errs` | `HTTPStatus(err)`, `WithCause`, `opts` cho `Wrap` | `httpx.Fail` cần lấy status từ error bất kỳ, kể cả error thường (→ 500) |
+| `log` | `MaskConfig.DisableElideHash` thay cho `HashElide` | Cùng hành vi, nhưng bool zero trong Go là `false` nên chỉ chiều phủ định giữ được mặc định "có hash" khi không khai gì |
+| `log` | `AttrUserType` (`user_type`) trong ContextHandler | `ctxmeta.Meta` đã có field này; đính thêm gần như miễn phí |
+| `log` | `Elided`, `LabelBase64/DataURI/Text`, `DefaultMaskFields()`, `NewMaskHandler` | Hình dạng metadata và danh sách field mặc định là thứ test của service cần assert được |
+| `config` | `Lookuper` định nghĩa lại trong package, không dùng `envconfig.Lookuper` | Không để đường dẫn import của thư viện env lọt vào API công khai — đổi thư viện về sau sẽ không phải breaking change. Hai interface giống hệt nhau nên gán trực tiếp được |
+| `crypto` | `NewCipherWithKeys`, `Key`, `PrimaryKeyID`, `KeyIDs` | Đặc tả yêu cầu key rotation nhưng chỉ có `NewCipher(key)` — cần đường khai nhiều khoá |
+| `crypto` | `SetDefaultCipher`, `DefaultCipher`, `ErrNoCipher` | `Encrypted.Value()`/`Scan()` do GORM gọi, không nhận tham số nào, nên cipher phải đến từ chỗ method tìm được |
+| `crypto` | `Encrypted.String/GoString/MarshalJSON/Reveal` | Đặc tả chỉ có `LogValue`, nhưng `fmt.Sprintf("%+v", model)` và `json.Marshal(model)` là hai đường lộ PII ngang hàng với log |
+| `crypto` | `NeedsRehash` | Ghi tham số vào chuỗi hash chỉ có ích nếu phát hiện được hash cũ để nâng cấp |
+| `retry` | `DefaultRetryable` và các hằng `Default*` | Chỗ gọi cần bọc lại luật mặc định thay vì viết lại từ đầu |
+| `tlsx` | `ErrConflictingSources` | Khai nhiều nguồn cho cùng một vật liệu là lỗi cấu hình, chỗ gọi cần phân biệt được nó với lỗi đọc file |
+
+Quyết định đáng ghi lại:
+
+- `SpanContext.NewChild()` trên giá trị không hợp lệ trả về **trace gốc mới**, không
+  nhân bản trace ID rỗng — nếu không, mọi request thiếu header sẽ dồn vào chung một
+  "trace" vô nghĩa.
+- `ParseTraceparent` **từ chối hex viết hoa** theo đúng đặc tả W3C. Chỗ gọi coi lỗi
+  parse là "không có trace thượng nguồn" và tạo trace gốc mới, chứ không phải lỗi request.
+- `errs.Is` quét **toàn bộ** chuỗi lỗi (kể cả qua `errors.Join`), còn `errs.As` trả
+  **lớp ngoài cùng** — lớp gần chỗ trả response nhất là phân loại đúng nhất cho client.
+- `errs.Register` là chỗ duy nhất có state toàn cục thay đổi được. Không tránh được:
+  một `*Error` tạo ở tầng repository không có đường cầm theo registry. Bù lại nó chỉ
+  dành cho lúc khởi tạo, và panic ngay nếu tham số sai.
+- `errs.New` với mã lỗi chưa đăng ký trả HTTP 500 thay vì panic — một mã viết sai
+  không được phép làm sập request đang xử lý.
+
+Quyết định của `core/log`:
+
+- **Thứ tự ưu tiên khi nhiều lớp cùng áp vào một giá trị:** tag (lớp 2) → tên field
+  (lớp 3) → kích thước (lớp 1). Lớp 1 áp cả lên kết quả của lớp 2: `log:"truncate=1000"`
+  với `MaxLen` 256 thì vẫn bị elide. Lưới an toàn có ngoại lệ thì không còn là lưới —
+  muốn giữ dài hơn thì nâng `MaxLen`.
+- **`MaskConfig.Fields` được trộn vào `DefaultMaskFields`, không thay thế.** Khai một
+  field riêng của app mà vô tình tắt việc che `password` là đúng cái cách log lộ mật
+  khẩu mà không ai nhận ra. Trùng tên thì bản khai tay thắng.
+- **So khớp tên field không phân biệt hoa thường, coi `-` như `_`**, nên `Authorization`,
+  `api-key`, `API_KEY` đều khớp.
+- **Tag sai cú pháp bị coi là `redact`.** Che chặt hơn ý muốn là hướng sai an toàn, và
+  output `********` thay vì giá trị mong đợi là thứ test nhận ra ngay.
+- **Cắt chuỗi theo rune, không theo byte** (`truncate`, `edges`). Cắt giữa một ký tự
+  UTF-8 làm dòng log chứa byte không hợp lệ, mà tiếng Việt thì ký tự nào cũng nhiều byte.
+  Cùng lý do, ngưỡng `MaxLen` chỉ tính là vượt khi vượt **cả** theo byte lẫn theo rune.
+- **`edges` trên giá trị ngắn hơn `p+s` thì che sạch**, không để lộ nguyên giá trị chỉ
+  vì nó ngắn hơn dự kiến. Số dấu sao chặn ở 32 để chuỗi dài không thành hàng nghìn dấu sao.
+- **`RuleHash` chỉ an toàn với giá trị đủ entropy.** sha256 của OTP 6 số hay số thẻ 16
+  số bị dò ngược trong vài giây; những giá trị đó phải dùng `redact` hoặc `edges`. Đã
+  ghi cảnh báo này trong godoc của `RuleHash`.
+- **`MaxLen` có sàn 16.** Chuỗi thay thế do chính cơ chế che sinh ra (`[REDACTED]` dài
+  10 byte) không được biến thành metadata elide.
+- **Trần dòng log bỏ attribute lớn nhất trước**, lặp tới khi lọt trần. Nhờ vậy
+  `trace_id`, `status`, `method` là những thứ sống sót cuối cùng — mất body còn tra được
+  request, mất cả dòng thì không.
+- **Kích thước dòng log là ước lượng theo byte thô**, chưa tính phần escape của JSON. Đo
+  chính xác đòi serialize hai lần cho mọi dòng log. Bù lại bằng cách đặt `MaxLineBytes`
+  thấp hơn giới hạn thật của backend.
+- **`SafeMap` trả về dữ liệu thuần** (`map`, `string`, số) chứ không phải type của gokit,
+  nên payload đã che có thể đem marshal bằng encoder nào cũng được.
+- **Trải phẳng struct nhúng giống `encoding/json`**, kể cả khi type nhúng là unexported:
+  bản thân field nhúng không lấy được qua `Interface()` nhưng các field export bên trong
+  thì lấy được, và bỏ qua sẽ làm log thiếu field so với body thật.
+- **Sắp xếp key của map trước khi ghi.** Thứ tự lặp map trong Go là ngẫu nhiên; không sắp
+  thì golden test vô dụng.
+- **Đệ quy chặn ở độ sâu 32.** Một struct trỏ vòng lại chính nó không được phép làm sập
+  process — logger là thứ cuối cùng được phép gây sự cố.
+
+Quyết định của 5 package cuối:
+
+- **`config` bật `DefaultOverwrite` của envconfig.** Mặc định của thư viện là **không**
+  ghi đè field đã có giá trị, nghĩa là mọi field khai trong YAML sẽ miễn nhiễm với biến
+  môi trường — mất hẳn thứ tự ưu tiên mà package hứa. Đã kiểm chứng bằng test.
+- **Thứ tự ưu tiên đầy đủ: env > YAML > `default=` trong tag > zero.** `default=` **không**
+  ghi đè YAML dù đã bật `DefaultOverwrite`, vì envconfig chỉ ghi đè khi biến thực sự có
+  mặt. Có test khoá hành vi này lại.
+- **Key lạ trong YAML là lỗi** (`KnownFields(true)`). Một key gõ sai bị im lặng bỏ qua là
+  kiểu sự cố tốn nhiều giờ nhất của config loader: cấu hình trông như đã khai mà thực tế
+  đang chạy giá trị mặc định.
+- **Blob của `crypto.Cipher` mang ID khoá, và ID đó nằm trong AAD của GCM.** Không xác thực
+  ID thì ai cũng sửa được ID trong blob để lừa hệ thống giải mã bằng khoá khác. Có test
+  đổi ID và test lật từng byte một ở mọi vị trí.
+- **`crypto` không cho cấu hình tham số nào ảnh hưởng độ an toàn.** Thuật toán, kích thước
+  nonce, tham số argon2 cố định trong code. Tham số quá thấp làm hash bị brute force, và
+  người khai thường không có cơ sở để chọn khác.
+- **`RuleHash`/`crypto` cảnh báo về entropy:** sha256 của OTP 6 số hay số thẻ 16 số bị dò
+  ngược trong vài giây. Đã ghi trong godoc.
+- **Mật khẩu rỗng bị từ chối ngay khi hash.** Nếu hash được thì `VerifyPassword("")` trả
+  true, và đó là đường vào hệ thống không cần mật khẩu.
+- **Lỗi giải mã không kể chi tiết của GCM** — chi tiết đó không giúp debug mà lại nói cho
+  người thử tấn công biết họ sai ở đâu.
+- **`tlsx` coi việc khai nhiều nguồn cho cùng một vật liệu là lỗi**, không phải thứ tự ưu
+  tiên. Khi cert trên đĩa khác cert trong env, đoán xem cái nào thắng là tự tạo sự cố.
+- **`retry.Jitter` chưa khai thì dùng mặc định 0.2, muốn tắt phải khai số âm.** Bất đối
+  xứng có chủ ý: mất jitter làm hỏng đúng tính chất package tồn tại để bảo đảm, còn bị
+  jitter khi không mong đợi thì không gây hại gì.
+- **`retry` gộp lỗi bằng `errors.Join` khi context kết thúc giữa lúc chờ**, để `errors.Is`
+  kiểm tra được cả lý do đang thử lại và lý do dừng.
+- **`timex` giữ nguyên location trong `StartOfDay`/`EndOfDay`.** Với giờ sát nửa đêm, đổi
+  sang UTC làm lệch hẳn một ngày.
+
 > **Cổng chặn:** API của `core` phải **đóng băng** trước khi sang Phase 3. Trong thiết kế multi-module, sửa breaking change ở `core` nghĩa là release `core`, rồi bump require + release lần lượt 6 module còn lại.
 
-### Phase 2 — `obs` + `httpx` `⬜`
+### Phase 2 — `obs` + `httpx` `✅`
 
-- [ ] `obs`: registry, `/metrics`, `HTTPMetrics`, `RegisterDBStats`, `RegisterRuntime`
-- [ ] `httpx/middleware`: `Trace`
-- [ ] `httpx/middleware`: `AccessLog`, `Recover`, `Timeout`, `CORS`, `MaxBodySize`
-- [ ] `httpx/middleware`: `BodyLog` — holder trong context + fallback `SafeMap`
-- [ ] `httpx/middleware`: `RateLimit` (in-process)
-- [ ] `httpx`: `Envelope`, `Decode[T]` (+ đăng ký body đã mask), `OK`/`Created`/`Fail`
-- [ ] `httpx`: error mapper từ `errs`
-- [ ] `httpx/validate`: rule cắm thêm được
-- [ ] `httpx/auth`: JWT, APIKey, BasicAuth
-- [ ] `httpx/health`: `/healthz`, `/readyz`
-- [ ] `httpx`: `Server` + `App` lifecycle (graceful shutdown)
-- [ ] `httpx/client`: retry + breaker + propagate trace + mask log
-- [ ] `httpx/idempotency`: middleware + `Store` interface + store in-memory
-- [ ] `examples/api`: service chạy được thật — **nơi kiểm chứng thiết kế**
+- [x] `obs`: registry, `/metrics`, `HTTPMetrics`, `RegisterDBStats`, `RegisterRuntime`
+- [x] `httpx/middleware`: `Trace`
+- [x] `httpx/middleware`: `AccessLog`, `Recover`, `Timeout`, `CORS`, `MaxBodySize`
+- [x] `httpx/middleware`: `BodyLog` — holder trong context + fallback `SafeMap`
+- [x] `httpx/middleware`: `RateLimit` (in-process)
+- [x] `httpx`: `Envelope`, `Decode[T]` (+ đăng ký body đã mask), `OK`/`Created`/`Fail`
+- [x] `httpx`: error mapper từ `errs`
+- [x] `httpx/validate`: rule cắm thêm được
+- [x] `httpx/auth`: JWT, APIKey, BasicAuth
+- [x] `httpx/health`: `/healthz`, `/readyz`
+- [x] `httpx`: `Server` + `App` lifecycle (graceful shutdown)
+- [x] `httpx/client`: retry + breaker + propagate trace + mask log
+- [x] `httpx/idempotency`: middleware + `Store` interface + store in-memory
+- [x] `examples/api`: service chạy được thật — **nơi kiểm chứng thiết kế**
+
+Coverage: `obs` 100%, `httpx` 88.1%. Chạy service mẫu thật (`ADDR=… go run ./api` + curl)
+là bước đã bắt được hai lỗi mà toàn bộ test unit không thấy — xem phần dưới.
 
 Test bằng `httptest`, không cần Docker.
 
-### Phase 3 — `db` + `cache` + `testx` `⬜`
+**`httpx` KHÔNG phụ thuộc `obs`** — khác đồ thị ở mục 3. `obs.HTTPMetrics` tự là một
+middleware nên app ghép nó vào chain; `httpx` không cần biết `obs` tồn tại. Ít một
+dependency, và `go mod tidy` là thứ phát hiện ra điều đó.
 
-- [ ] `db`: `Open`, `Config`, gorm slog logger, đăng ký `RegisterDBStats`
-- [ ] `db/model`: base entity ghép được + `AuditPlugin`
-- [ ] `db/query`: `Apply`, `Paginate` (có whitelist)
-- [ ] `db/query`: cursor pagination
-- [ ] `db/migrate`
-- [ ] `cache`: `Client` trên `UniversalClient` + các interface tách nhỏ
-- [ ] `cache`: `GetOrLoad` + singleflight
-- [ ] `cache/lock` (context bị cancel khi mất lock)
-- [ ] `cache/leader`
-- [ ] `cache/cron`
-- [ ] `cache/idemstore` (store Redis cho idempotency)
-- [ ] `testx`: container helper, `CaptureLogs`, `Golden`
+**Cách xử lý module chưa publish:** `httpx/go.mod` và `examples/go.mod` khai `require`
+kèm `replace` trỏ vào cây nguồn trong repo, vì `core` chưa có bản nào trên proxy. Hệ quả
+cần biết: job `nowork` không còn kiểm được lệch version giữa các module nữa, chỉ còn
+kiểm thiếu `require` và lệch `go` directive. Bỏ `replace` và điền version thật ở Phase 5.
+
+Quyết định của Phase 2:
+
+- **`obs.HTTPOptions.RoutePattern` không mặc định về `r.URL.Path`.** Không khai thì nhãn
+  là `"unknown"`. Mặc định an toàn quan trọng hơn mặc định tiện: một scanner quét vài
+  nghìn URL lạ sẽ sinh vài nghìn series và làm Prometheus hết bộ nhớ.
+- **Có `obs.ServeMuxRoute`** vì `r.Pattern` của ServeMux gồm cả method (`GET /users/{id}`),
+  nên dùng thẳng nó sẽ nhân đôi thông tin đã có ở label `method`.
+- **`RegisterDBStats` đưa `name` vào constant label**, không phải variable label. Prometheus
+  so trùng collector theo tập `Desc`, nên hai database sẽ bị coi là trùng nếu dùng variable
+  label — test bắt được đúng lỗi này.
+- **`middleware.Timeout` không dùng `http.TimeoutHandler`** của stdlib vì nó buffer toàn bộ
+  response trong RAM. Thay bằng writer có mutex: hết hạn thì ghi 503 rồi khoá, handler ghi
+  tiếp nhận `http.ErrHandlerTimeout`. Nhờ vậy client nhận response **ngay tại mốc timeout**
+  thay vì phải chờ handler chịu dừng.
+- **`middleware.CORS` và `RateLimit` trả `error`.** Cấu hình CORS sai biểu hiện thành lỗi
+  trên trình duyệt của người dùng cuối, rất xa chỗ khai; `"*"` cùng `AllowCredentials` là
+  cấu hình trình duyệt từ chối theo đặc tả, nên phải lộ ra lúc dựng.
+- **`RateLimit` có trần số key bắt buộc.** Hạn mức theo IP với map không giới hạn là một
+  đường làm hết bộ nhớ, và người tấn công chỉ cần đổi IP nguồn.
+- **`Trace` mặc định KHÔNG tin request ID của client.** Tin nghĩa là client trộn được log
+  của mình vào log của request khác. ID nhận từ client bị lọc ký tự và cắt độ dài — một ký
+  tự xuống dòng trong đó là log injection.
+- **`BodyLog` không tự parse multipart.** Chỉ đọc metadata từ `r.MultipartForm` nếu handler
+  đã gọi `ParseMultipartForm`. Tự parse nghĩa là đọc hết body vào RAM hoặc đĩa tạm cho
+  **mọi** request upload chỉ để ghi log.
+- **`BodyLog` parse JSON với `UseNumber`.** Không có nó thì một ID 19 chữ số trong log thành
+  `1.2345678901234568e+18` — mất đúng những chữ số cần để tra cứu.
+- **`Decode` bật `DisallowUnknownFields`.** Client gửi `amout` thay vì `amount` mà server im
+  lặng bỏ qua rồi xử lý với số tiền 0 là kiểu sự cố tệ nhất trong nhóm này.
+- **`httpx.Fail` không bao giờ đưa `err.Error()` của error thường ra client** — nội dung đó
+  thường chứa tên host, câu SQL, đường dẫn file.
+- **`auth` từ chối thuật toán `none`, và bắt token dùng đúng thuật toán đã khai.** Có test
+  riêng cho lỗ hổng algorithm confusion ở cả nhánh ECDSA và RSA: token ký HMAC với khoá là
+  public key của server phải bị từ chối.
+- **`auth` đòi khoá HMAC tối thiểu 32 byte.** Khoá ngắn làm HMAC bị brute force, và đây là
+  loại sai không có triệu chứng nào cho tới khi bị khai thác.
+- **`/healthz` cố tình không kiểm tra dependency nào.** Nối liveness với database nghĩa là
+  database chập một nhịp sẽ làm Kubernetes restart toàn bộ pod cùng lúc — biến sự cố nhỏ
+  thành sự cố toàn hệ thống.
+- **`health.Ready` chạy checker song song và bọc `recover`** quanh từng checker: một checker
+  panic không được biến việc kiểm tra sức khoẻ thành nguyên nhân gây sự cố.
+- **`App` dừng thành phần theo thứ tự ngược thứ tự thêm**, và một thành phần lỗi làm cả app
+  dừng. Service còn HTTP sống nhưng consumer đã chết vẫn qua health check và vẫn nhận
+  traffic, trong khi nửa chức năng đã ngừng — thà chết hẳn để Kubernetes restart.
+- **`client.Do` giữ lại response của lần thử cuối.** `retry.DoValue` trả giá trị zero khi
+  lỗi, mà chi tiết của một lỗi 5xx nằm chính trong body đó. Và `statusError` chỉ là tín hiệu
+  nội bộ cho vòng retry, không phải lỗi trả ra — đã nhận được response thì không phải lỗi
+  "không gọi được". Test bắt được cả hai.
+- **`client` đọc hết body vào bộ nhớ** trước khi gửi, vì retry cần gửi lại: một `io.Reader`
+  đã đọc hết thì lần retry sẽ gửi body rỗng.
+- **`idempotency` chỉ lưu kết quả 2xx/3xx.** Lưu cả 5xx nghĩa là client retry sẽ nhận lại
+  đúng lỗi đó mãi dù nguyên nhân đã hết. Handler panic thì nhả khoá, nếu không client nhận
+  409 suốt TTL dù không có gì đang chạy.
+- **`idempotency` từ chối request khi Store lỗi** thay vì chạy tiếp: không biết request đã
+  chạy chưa thì chạy tiếp có thể tạo bản ghi trùng — đúng cái mà lớp này tồn tại để ngăn.
+
+**Hai lỗi chỉ chạy service mẫu thật mới phát hiện được** (test unit đều xanh trước đó):
+
+1. **Số thẻ lọt nguyên vẹn vào log ở đường idempotency phát lại.** Request phát lại không
+   chạy handler → không có `Decode` → không có bản mask theo tag → rơi về lớp 3, mà
+   `card_no` không nằm trong `DefaultMaskFields`. Fallback hoạt động đúng đặc tả, nhưng
+   **mặc định chưa an toàn**. Đã bổ sung nhóm thanh toán (`card_no`, `card_number`, `pan`,
+   `cvv`, `cvc`) và nhóm xác thực còn thiếu (`old_password`, `id_token`, `client_secret`,
+   `private_key`) vào danh sách mặc định của `core/log`.
+2. **Log response hiện cả field mà HTTP response đã bỏ** (`code:""`, `data:null`,
+   `elapsed_ms:0`), vì walk bằng reflect không tôn trọng `omitempty`. Đã sửa `core/log` để
+   tôn trọng nó — dòng log giờ có cùng hình dạng với JSON thật đi ra dây, đúng mục tiêu đã
+   ghi trong godoc.
+
+Một **data race thật trong code thư viện** do `-race` bắt: `Server.Addr()` là method công
+khai đọc field mà `Run()` ghi từ goroutine khác. Đã đổi sang `atomic.Pointer[string]`.
+
+Một góp ý đúng của linter đã tiếp nhận: `net.Listen` → `(*net.ListenConfig).Listen` để việc
+bind cũng tôn trọng context.
+
+### Phase 3 — `db` + `cache` + `testx` `✅`
+
+- [x] `db`: `Open`, `Config`, gorm slog logger, đăng ký `RegisterDBStats`
+- [x] `db/model`: base entity ghép được + `AuditPlugin`
+- [x] `db/query`: `Apply`, `Paginate` (có whitelist)
+- [x] `db/query`: cursor pagination
+- [x] `db/migrate`
+- [x] `cache`: `Client` trên `UniversalClient` + các interface tách nhỏ
+- [x] `cache`: `GetOrLoad` + singleflight
+- [x] `cache/lock` (context bị cancel khi mất lock)
+- [x] `cache/leader`
+- [x] `cache/cron`
+- [x] `cache/idemstore` (store Redis cho idempotency)
+- [x] `testx`: container helper, `CaptureLogs`, `Golden`
 
 Phase này CI cần Docker. Test integration để sau build tag `integration`.
 
-### Phase 4 — `kafka` `⬜`
+**Ghi chú khi làm phần `db`** — những chỗ lệch so với đặc tả ở [mục 4.14](#414-db), và lý do:
 
-- [ ] `Producer` (sync + async), SASL/TLS
-- [ ] Propagate trace qua Kafka header
-- [ ] `Consumer` với handler + concurrency
-- [ ] Retry + DLQ
-- [ ] Metrics qua `kprom`
-- [ ] Test bằng `kfake` của franz-go + 1 test integration thật
+- **`Open` tự dựng `*sql.DB` rồi mới đưa cho driver GORM**, thay vì truyền DSN. Cả pgx lẫn
+  go-sql-driver chỉ nhận `*tls.Config` đầy đủ qua struct Go; qua DSN thì Postgres chỉ có
+  `sslmode` và MySQL chỉ có một tên trong registry toàn cục. Dựng ở tầng mình nên
+  `tlsx.Options` dùng được nguyên vẹn, và mật khẩu không phải đi qua bước nối chuỗi — chỗ mà
+  password có dấu cách hay dấu nháy sẽ hỏng theo cách rất khó tìm. Có test với mật khẩu
+  `p@ss w/ord:'"#?&`.
+- **`Config.LogSQLParams`, mặc định `false`.** GORM mặc định thay giá trị tham số vào câu SQL
+  trước khi log — tức là số tài khoản, số điện thoại, email đi thẳng vào log tập trung. Logger
+  cài `gorm.ParamsFilter` để giữ nguyên dấu `?`. Câu lệnh vẫn đủ để biết query nào chậm.
+- **`Config.Schema` khai với MySQL là lỗi**, không phải bị bỏ qua. Ở MySQL "schema" đồng nghĩa
+  database, nên giá trị đó không có chỗ dùng — và một field config bị bỏ qua trong im lặng là
+  cách tạo ra sự cố không ai tìm được nguyên nhân.
+- **`gorm.Config.TranslateError = true`.** Không có nó thì code nghiệp vụ phải so khớp chuỗi
+  thông báo lỗi để biết đâu là vi phạm unique, và chuỗi đó khác nhau giữa Postgres với MySQL.
+- **Thêm `db.Close`, `db.Stats`, `db.RegisterMetrics`.** GORM không có `Close` vì `*gorm.DB` là
+  handle chứ không phải connection; ba hàm này là chỗ duy nhất cần biết điều đó.
+- **`query`: `Like`/`ILike` luôn là "chứa", và escape `%`, `_` trong giá trị.** Để client tự
+  khai pattern nghĩa là client kiểm soát được việc câu query có dùng index hay không, và
+  `%a%a%a%a%b` là đủ để đốt CPU của database. Ký tự escape là `!` chứ không phải `\`:
+  `ESCAPE '\\'` chạy đúng ở MySQL thì sai ở Postgres và ngược lại.
+- **`query`: `Eq`/`Ne`/`Gt`... từ chối `nil` và slice.** GORM lặng lẽ diễn giải lại `= nil`
+  thành `IS NULL` và `= []T{...}` thành `IN (...)`. Cả hai đã có Op riêng, nên để chúng lọt
+  qua chỉ tạo hai đường làm cùng một việc — và một trong hai thì client không biết mình đang đi.
+- **`query`: `In`/`NotIn` với danh sách rỗng.** `IN ()` là lỗi cú pháp ở cả hai database. IN
+  rỗng khớp 0 dòng, NOT IN rỗng khớp mọi dòng — xử lý tường minh, có test.
+- **`ApplyCursor` một tiêu chí sắp xếp không được bọc `clause.Or`.** Đây là một bẫy thật của
+  GORM: `OrConditions` chỉ có một phần tử được nối vào các điều kiện khác bằng `OR` chứ không
+  phải `AND`, nên bọc lại sẽ làm mọi filter phía trước mất tác dụng. Có test riêng cho nó.
+- **`ApplyCursor` từ chối giá trị `null` trong cursor.** Mọi phép so sánh với NULL cho UNKNOWN,
+  nên nhánh chứa nó lặng lẽ không khớp dòng nào và trang sau trả về rỗng — mất dữ liệu mà
+  không có lỗi nào.
+- **`migrate.Rollback` nhận thêm `opts Options`** (đặc tả không có). Không có nó thì `Run` với
+  `Options.Table` tuỳ chọn sẽ khiến `Rollback` đọc sai bảng lịch sử.
+- **`migrate` có advisory lock** (`pg_try_advisory_lock` / `GET_LOCK`) trên một connection
+  riêng giữ suốt phiên. Deploy nhiều pod, mỗi pod migrate lúc khởi động, là mặc định — và hai
+  pod cùng `CREATE TABLE` thì một pod chết. Driver không có advisory lock (SQLite) chạy không
+  khoá kèm log; `Options.DisableLock` để tắt.
+- **`migrate.Rollback` kiểm tra toàn bộ kế hoạch trước khi chạy** — thiếu `Down` ở giữa danh
+  sách thì không hoàn tác gì cả, thay vì dừng nửa đường và để lại schema không môi trường nào
+  khác có.
+- **`model.Audit` không nhúng `model.Timestamps`.** Entity nhúng cả hai sẽ có hai cột
+  `created_at` trùng tên, và lỗi chỉ hiện ra lúc chạy. Bốn dòng lặp lại rẻ hơn cái bẫy đó.
+- **`AuditPlugin` bỏ qua câu lệnh không có `Model`, và `Updates` với struct khác kiểu model.**
+  `Statement.SetColumn` ghi theo *chỉ số field* lấy từ schema; với một kiểu khác thì chỉ số đó
+  trỏ vào field khác hoặc ra ngoài struct. Bỏ qua thì mất cột audit, không bỏ qua thì ghi sai
+  dữ liệu. Có test cho cả hai đường.
+
+Test đơn vị của `db` **không cần Docker**: `query` và `model` kiểm tra câu SQL sinh ra bằng
+`gorm.Config{DryRun: true}` với dialector Postgres và MySQL thật, còn `migrate` chạy trên
+SQLite thuần Go (file tạm). Phần phụ thuộc dialect thật — advisory lock, DDL của từng
+database — để dành cho test `integration`.
+
+**Ghi chú khi làm phần `cache`** — những chỗ lệch so với đặc tả ở [mục 4.15](#415-cache):
+
+- **`cache` không import `obs`.** Đồ thị phụ thuộc ở [mục 3](#3-cấu-trúc-repo) vẽ
+  `obs ← cache`, nhưng hoá ra không cần: thứ đáng đo của Redis là lệnh lỗi và lệnh chậm,
+  và một `redis.Hook` ghi qua slog làm được việc đó mà không kéo Prometheus vào. App muốn
+  metric thì tự đăng ký từ `Redis().PoolStats()`. Giống hệt tình huống của `httpx`.
+- **Một quy tắc mã hoá, viết ra thành một câu: `string` và `[]byte` lưu thô, mọi thứ khác
+  lưu JSON.** Để go-redis tự chọn — cách mặc định — thì `bool` thành `"1"` và đọc lại vào
+  `*bool` là lỗi; bọc mọi thứ trong JSON thì giá trị đếm không dùng được với `INCR` và
+  `redis-cli get` trả về chuỗi có dấu nháy. Có test round-trip cho bool, số, `time.Time`.
+- **`TTL` dịch hai giá trị âm của Redis ra hai kết quả khác nhau**: `-2` (key không tồn
+  tại) thành `ErrMiss`, `-1` (không có hạn) thành `0`. Trả nguyên số âm ra ngoài là cách
+  chắc chắn có người đem nó đi cộng vào một mốc thời gian.
+- **`Scan` trả lỗi ở chế độ cluster** thay vì trả danh sách thiếu. SCAN không có key nên
+  go-redis gửi nó tới một node bất kỳ, và kết quả là key của đúng node đó — thiếu phần còn
+  lại mà không có lỗi nào. Thông báo lỗi chỉ ra đường đúng (`ForEachMaster`).
+- **Hook không ghi log lỗi của lệnh `CLIENT`.** go-redis gửi `CLIENT SETINFO` (cần Redis
+  7.2) và `CLIENT MAINT_NOTIFICATIONS` khi mở mỗi connection rồi bỏ qua lỗi nếu server
+  không hỗ trợ. Trên Redis 6.x — vẫn còn rất nhiều — mỗi connection mới sinh ra một dòng
+  ERROR mà chẳng có gì sai, và điều đó làm mọi alert theo error rate mất giá trị. Phát hiện
+  nhờ chính test chạy trên server giả.
+- **Hook chỉ ghi tên lệnh, không ghi đối số.** Đối số của Redis là key và giá trị, tức là
+  dữ liệu người dùng. Cùng lý do như `Config.LogSQLParams` ở module `db`, và có test.
+- **`ErrMiss` dùng mã riêng `cache_miss`, không phải `errs.CodeNotFound`.** "Không có trong
+  cache" và "không có trong hệ thống" là hai chuyện khác nhau; gộp lại thì một cache miss
+  lọt ra tới tầng HTTP sẽ thành 404 trả cho client. Mã này **không** đăng ký vào bảng của
+  `errs`, nên nếu nó lọt ra thật thì thành 500 — đúng, vì đó là lỗi lập trình.
+- **`GetOrLoad` không trả lỗi khi Redis hỏng**, chỉ ghi log: đọc lỗi thì vẫn gọi `load`,
+  ghi lỗi thì vẫn trả dữ liệu. Cache hỏng không được biến thành API hỏng.
+- **`Lock.Context()` là hai tầng context.** Tầng ngoài mang deadline (nên
+  `ctx.Deadline()` của công việc nói đúng lúc khoá hết hạn), tầng trong mang cancel-cause
+  (nên phân biệt được `ErrReleased` với `ErrLockLost` bằng `context.Cause`).
+- **`Lock.Release` idempotent**, vì `defer lk.Release(ctx)` cộng một Release tường minh là
+  mẫu rất thường gặp. Release khi khoá đã hết hạn trả `ErrLockLost` — đó là tình huống cần
+  biết, nó nghĩa là công việc vừa rồi *có thể* đã chạy song song với một instance khác.
+- **`cache/cron` dùng `robfig/cron/v3`** (không có trong danh sách dep của bản nháp). Tự
+  viết parser biểu thức cron là vài trăm dòng và sai ở các trường hợp biên; thư viện này
+  không có dependency nào. Phần bọc job — chặn chạy chồng, `recover`, log kết quả — thì tự
+  viết, để không phải làm adapter cho interface Logger của nó.
+- **`cron.New`, không phải `cron.NewCron`.** `cron.NewCron` là stutter, và linter chặn.
+- **Một cái bẫy của thư viện đã ghi vào godoc:** `@every` nhỏ hơn một giây bị robfig **âm
+  thầm nâng lên một giây**. Phát hiện bằng một test đếm số lần chạy — không có test đó thì
+  nó chỉ hiện ra ở production dưới dạng "job chạy ít hơn mong đợi 10 lần".
+- **`cron` dựng một scheduler mới cho mỗi nhiệm kỳ leader** thay vì start/stop lại một
+  instance dùng chung: sau một lần đổi leader, trạng thái "lần chạy tiếp theo" của instance
+  cũ đã lệch.
+- **`idemstore` lưu trạng thái bằng một byte tiền tố trước JSON**, không phải một field
+  trong JSON. Nhờ vậy script Lua đọc được trạng thái bằng `string.sub`, không cần `cjson` —
+  thư viện đó không có ở mọi bản Redis. `Reserve` là **một** script (GET rồi SET NX riêng
+  lẻ thì hai request chen vào giữa được), và `Release` chỉ xoá khi key còn ở trạng thái
+  đang xử lý (xoá vô điều kiện thì một Release sau `Commit` sẽ làm lần gửi lại tiếp theo
+  chạy handler lần nữa). Có test cả hai đường, cộng một test đầu-cuối với chính
+  `idempotency.Middleware`.
+
+Test đơn vị của `cache` **không cần Docker**: mọi thứ chạy trên
+[miniredis](https://github.com/alicebob/miniredis) — server Redis thuần Go có TTL thật và
+có `EVAL`, nên script Lua của `idemstore` và của `redislock` được kiểm bằng đường thật.
+`FastForward` của nó cũng cho phép test hết hạn khoá mà không sleep.
+
+**Ghi chú khi làm phần `testx`** — những chỗ lệch so với đặc tả ở [mục 4.17](#417-testx):
+
+- **`FreezeTime` trả về `*Clock` chứ không đóng băng thời gian toàn cục.** Go không có
+  cách đổi `time.Now` của cả process, và điều đó là tốt: một hàm làm được việc đó sẽ khiến
+  hai test chạy song song can thiệp vào nhau. Cái giá là code cần test phải nhận nguồn thời
+  gian (`now func() time.Time`) thay vì gọi `time.Now` trực tiếp — cùng nguyên tắc "inject
+  tường minh" đã dùng ở mọi chỗ khác.
+- **`Golden` bật chế độ ghi lại bằng biến môi trường `UPDATE_GOLDEN`, không phải flag
+  `-update`.** Một thư viện đăng ký flag toàn cục sẽ xung đột với flag cùng tên của project
+  dùng nó, và lỗi hiện ra dưới dạng "flag redefined" lúc chạy test — rất khó lần ra nguồn.
+- **`Golden` báo Fatal khi file chưa có**, kèm hướng dẫn, thay vì im lặng tạo mới: tạo mới
+  trong im lặng nghĩa là lần chạy đầu luôn xanh dù kết quả có sai.
+- **Thêm `GoldenClean`**: file golden bị bỏ quên là thứ tích lại theo thời gian và không ai
+  dám xoá vì không biết còn dùng hay không.
+- **`LoadFixture` bật `DisallowUnknownFields` / `KnownFields(true)`.** Một field gõ sai
+  trong fixture sẽ thành giá trị zero trong struct, và test vẫn xanh — đúng loại lỗi tệ
+  nhất.
+- **Không dùng `testify`.** Bốn nhóm helper này không cần thư viện assert nào, và không kéo
+  nó về nghĩa là service dùng gokit tự chọn được thư viện assert của mình.
+- **Container dùng các module chính thức của testcontainers** (`modules/postgres`,
+  `modules/mysql`, `modules/redis`, `modules/kafka`) thay vì `GenericContainer`: phần khó
+  của việc dựng container là wait strategy, và Postgres in ra "ready" một lần rồi restart —
+  chờ log một lần là nguyên nhân kinh điển của test integration chập chờn.
+- **Ảnh Docker ghim tag cụ thể, không `latest`.** Nâng version là một thay đổi có chủ ý và
+  nhìn thấy được trong diff.
+- **`registerTerminate` gọi trước khi kiểm lỗi của `Run`**: `Run` trả về cả container lẫn
+  lỗi khi nó dựng được container nhưng chờ readiness thất bại, và bỏ qua trường hợp đó sẽ
+  để lại container mồ côi chạy mãi trên máy dev.
+
+Test của `testx` dùng một `testing.TB` giả (`fakeTB`) để kiểm chính việc "helper có báo lỗi
+đúng lúc không" — không có nó thì mọi `Errorf` đúng đắn của helper sẽ làm test đỏ.
+
+**Một test chập chờn có sẵn từ Phase 2 đã sửa.** `obs.TestHTTPMetrics` khẳng định "path
+thật không được thành label" bằng cách tìm chuỗi `"999999"` trong **text của cả lần
+scrape**. Text đó có cả giá trị số của histogram, và một tổng như `2.6669999999999996e-06`
+chứa đúng chuỗi đó — nên test đỏ tuỳ theo độ trễ đo được, khoảng 1 lần trên 5 dưới `-race`.
+Đã đổi sang kiểm trên giá trị label lấy từ `reg.Gather()`: chỉ label mới sinh series, nên
+chỉ label là chỗ đáng kiểm. Khẳng định giữ nguyên, chỉ hết chập chờn.
+
+### Phase 4 — `queue/kafka` `✅`
+
+- [x] `Producer` (sync + async), SASL/TLS
+- [x] Propagate trace qua Kafka header
+- [x] `Consumer` với handler + concurrency
+- [x] Retry + DLQ
+- [x] Metrics qua `kprom`
+- [x] Test bằng `kfake` của franz-go + 1 test integration thật
+
+**Ghi chú khi làm phần `queue/kafka`** — những chỗ lệch so với đặc tả ở
+[mục 4.16](#416-queuekafka), và lý do:
+
+- **Một deadlock thật ở lúc shutdown, do chính test bắt được.** Consumer bật
+  `BlockRebalanceOnPoll` để rebalance không xảy ra giữa lúc đang xử lý một lô — không có nó
+  thì partition bị thu hồi giữa chừng và lần commit sau ghi offset cho partition mà instance
+  này không còn sở hữu. Cái bẫy đi kèm: **mọi** đường ra khỏi một lần poll đều phải gọi
+  `AllowRebalance`. Bản đầu thoát sớm khi `ctx` bị cancel mà không gọi, và `Close` treo vĩnh
+  viễn — vì rời group cũng là một lần rebalance, và nó đang bị chặn bởi đúng lần poll vừa
+  thoát ra. Triệu chứng chỉ hiện ra lúc shutdown, tức là chỗ ít ai test nhất.
+- **Xử lý song song theo partition, tuần tự trong partition.** `Concurrency` không phải số
+  worker bốc message từ chung một hàng đợi — cách đó phá đúng đảm bảo thứ tự duy nhất mà
+  Kafka cho. Có test với 4 partition, 4 goroutine, 100 message, kiểm offset trong từng
+  partition luôn tăng.
+- **Không khai `DLQTopic` thì message hết lượt thử lại làm `Run` trả lỗi.** Ba lựa chọn
+  đều có giá: bỏ qua trong im lặng là mất dữ liệu, thử lại mãi là chặn cả partition mà không
+  ai biết, dừng service là ồn ào nhưng nhìn thấy được. Chọn cái ồn ào. Muốn "bỏ qua" thì để
+  handler trả `nil` — ở đó mới có đủ ngữ cảnh để quyết định, và hợp đồng của [Handler] nói
+  rõ điều đó.
+- **Đẩy vào DLQ là thao tác đồng bộ, và phải xong trước khi commit.** Commit trước khi DLQ
+  nhận được là mất hẳn message. Đẩy DLQ thất bại thì `Run` trả lỗi và cả lô được gửi lại.
+- **Panic trong handler được `recover` và biến thành error.** Không bắt thì cả process chết,
+  và mọi partition khác mà instance này đang giữ ngừng theo.
+- **`franz-go` bật ghi idempotent mặc định, và cơ chế đó đòi `acks=all`.** Hạ `RequiredAcks`
+  mà quên `DisableIdempotentWrite` thì client trả một lỗi cấu hình rất khó hiểu. Package tự
+  xử lý; có test cho cả ba mức acks.
+- **SASL/PLAIN không có TLS bị chặn ngay ở `NewProducer`/`NewConsumer`.** Cơ chế đó gửi mật
+  khẩu **nguyên văn** trên dây, và đây là cấu hình rất dễ vô tình để lọt ra production.
+  SCRAM không TLS thì cho qua — nó không gửi mật khẩu nguyên văn.
+- **`MaxRetries` và `RetryBackoff.MaxAttempts` là hai field cùng nói về một thứ**, nên quy
+  tắc gộp được viết ra một chỗ: `> 0` thì thắng (`MaxAttempts = MaxRetries + 1`), `< 0` là
+  không thử lại, `= 0` thì giữ nguyên `RetryBackoff`.
+- **Producer chế độ `Async` chỉ báo lỗi qua log và metric.** `Send` trả `nil` ngay cả khi
+  việc gửi sau đó thất bại, nên callback ghi log là thứ duy nhất giữ message khỏi biến mất
+  trong im lặng. Có test bắt đúng dòng log đó.
+- **Thêm `Producer.Flush`.** Ở chế độ async, không flush trước khi dừng là mất message còn
+  trong bộ đệm. `Close` cũng flush; `Flush` riêng dành cho điểm chốt giữa chừng.
+- **Metric chia hai tầng.** `kprom` đo phần ở tầng client (byte qua dây, số lần kết nối lại,
+  độ trễ request tới broker) — nhóm trả lời "vấn đề ở mạng hay ở code". Package tự đăng ký
+  thêm nhóm về **kết quả xử lý**: `kafka_consumer_messages_total{topic,group,result}` với
+  result = ok|dlq|error, `kafka_consumer_retries_total`, và histogram thời gian handler.
+  DLQ tăng nghĩa là có dữ liệu đang không được xử lý — kprom không biết điều đó.
+  Namespace của kprom tách theo vai trò (`kafka_producer_`, `kafka_consumer_`) để producer
+  và consumer trong cùng một process đăng ký được vào cùng một registry.
+- **`traceparent` không bị ghi đè nếu chỗ gọi đã đặt sẵn**, và `Send` không sửa map
+  `Headers` của chỗ gọi. Cái thứ nhất là để phát lại message từ DLQ mà vẫn giữ trace gốc;
+  cái thứ hai là để gửi cùng một `Message` hai lần không sinh tác dụng phụ.
+- **Consumer luôn tạo span *con*, không dùng lại span của producer.** Việc xử lý ở consumer
+  là một chặng riêng trong cùng một trace, nên nó cần span ID của mình.
+- **`Message.Headers` là map, trong khi Kafka cho phép trùng key.** Đánh đổi có ý thức:
+  header trùng key hầu như không được dùng, còn map thì đọc và ghi dễ hơn hẳn một slice cặp
+  key/value. Trùng key thì giá trị cuối thắng.
+- **`Consumer.Run` chỉ chạy được một lần cùng lúc.** Hai vòng lặp cùng poll một client sẽ
+  chia nhau message theo cách không ai kiểm soát được, và commit của bên này ghi đè tiến độ
+  của bên kia.
+
+Test đơn vị **không cần Docker**: chúng chạy trên `kfake` — bản cài đặt protocol Kafka thuần
+Go của chính franz-go, có partition thật, consumer group thật, commit offset thật. Nhờ vậy
+những thứ chỉ lộ ra khi nói chuyện với broker (rebalance, commit, thứ tự trong partition)
+đều được kiểm bằng đường thật. Một test integration duy nhất chạy trên Kafka thật trong
+Docker (`testx.KafkaContainer`, build tag `integration`) làm chốt cuối cho phần `kfake`
+không mô phỏng được: phiên bản broker thật và cấu hình phía server.
+
+**Một lỗi trong `testx` do chính test integration này bắt được.** Helper container gọi
+`registerTerminate` trước khi kiểm lỗi của `Run` — đúng, vì `Run` có thể trả về **cả**
+container lẫn lỗi. Nhưng khi `Run` thất bại hẳn thì nó trả về một `*Container` **nil**, và
+một con trỏ nil nhét vào interface thì interface đó khác nil: cái bẫy kinh điển của Go. Phép
+so sánh `c == nil` cho qua, rồi `Terminate` panic ở bước dọn dẹp và **che mất lỗi thật** —
+màn hình chỉ còn một stack trace nil pointer thay vì dòng "Docker chưa chạy". Đã đổi sang
+kiểm bằng reflect, có test riêng cho cả hai trường hợp.
 
 ### Phase 5 — Hoàn thiện `⬜`
 
 - [ ] Godoc mọi symbol export + `Example` function
 - [ ] `examples/`: consumer, cron job
-- [ ] Tag `core/v0.1.0`, `obs/v0.1.0`, ... (**tag có prefix theo tên module**)
+- [ ] Tag `core/v0.1.0`, `obs/v0.1.0`, `queue/kafka/v0.1.0`, ... (**prefix là đường dẫn module tính từ gốc repo**, nên module lồng thì tag cũng lồng)
 - [ ] `CHANGELOG.md` mỗi module
 - [ ] `docs/adr/` — ghi lại lý do các quyết định
 - [ ] Giữ ở `v0.x` cho tới khi API ổn định — `v1` là lời hứa tương thích
@@ -1144,7 +1665,7 @@ Phase này CI cần Docker. Test integration để sau build tag `integration`.
 |---|---|---|---|
 | Unit | toàn bộ `core`, `obs`, `httpx` (qua `httptest`) | Không | Mọi commit |
 | Golden | định dạng JSON của log, shape của `Envelope` | Không | Mọi commit |
-| Integration | `db`, `cache`, `kafka` (testcontainers) | Có | PR + nightly |
+| Integration | `db`, `cache`, `queue/kafka` (testcontainers) | Có | PR + nightly |
 | Race | `go test -race` toàn bộ | Không | Mọi commit |
 
 Ưu tiên test cho những chỗ dễ sai nhất:
@@ -1176,6 +1697,7 @@ Phase này CI cần Docker. Test integration để sau build tag `integration`.
 | Hạng mục | Lý do |
 |---|---|
 | DI container | Wiring bằng constructor rõ ràng hơn; DI container che mất đồ thị phụ thuộc và fail lúc runtime thay vì compile time |
+| Interface chung cho `queue/*` (`Publisher`, `Subscriber`) | Mô hình của các broker khác nhau ở đúng chỗ quan trọng: partition/offset/commit tay của Kafka, exchange/ack/prefetch của RabbitMQ, visibility timeout của SQS. Một interface phủ hết chúng chỉ còn `Publish(topic, msg)` — bỏ mất lý do người ta chọn broker đó. Thư mục `queue/` là namespace, không phải abstraction |
 | Oracle, SQL Server | CGO của `godror` gây khổ cho build/CI; không có nhu cầu |
 | `sqlx` | Không cần Oracle/MSSQL nữa; Postgres thì `pgx` trực tiếp tốt hơn |
 | Object mapper tự động (`copier`) | Bỏ lỗi im lặng. Map tay hoặc dùng codegen (`goverter`) |
